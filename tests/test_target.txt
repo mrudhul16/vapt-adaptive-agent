@@ -1,0 +1,9 @@
+Notes on Juice Shop manual testing findings
+
+- Basket endpoint: GET /rest/basket/{id}
+  - Requires Authorization header (Bearer token) — plain browser URL requests get 401
+  - My logged-in basket ID was 6
+
+- Score Board: hidden route at /#/score-board (not linked in UI, found via direct URL guess)
+
+- Still to test: SQLi login bypass challenge, XSS challenge
