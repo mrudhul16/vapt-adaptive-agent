@@ -1,8 +1,14 @@
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, List
-from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
+from dotenv import load_dotenv
 
-llm = ChatOllama(model="llama3.1:8b")
+load_dotenv()
+
+llm = ChatGroq(
+    model="openai/gpt-oss-120b",
+    temperature=0
+)
 
 # All modules the agent knows about, run once each unless chained back in
 CORE_MODULES = ["fingerprint", "auth_check", "sqli_check", "xss_check"]
