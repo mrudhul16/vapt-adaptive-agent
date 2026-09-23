@@ -1,58 +1,58 @@
-"""
-Module 2: Memory & State Management
-"""
-
-from typing import TypedDict, List, Dict, Optional
+from typing import TypedDict, List, Optional
 
 
 class AgentState(TypedDict):
     target_url: str
-    max_steps: int
-    chaining_enabled: bool  # NEW — toggle for baseline vs full evaluation
-
-    tech_stack: Dict
-    discovered_pages: List[str]
-    discovered_params: List[str]
-
-    findings: List[Dict]
-    auth_status: Dict
-
+    tech_stack: dict
+    pages: List[str]
+    findings: List[dict]
     modules_run: List[str]
-    step_count: int
-    pending_chain: Optional[Dict]
-    done: bool
-    _next_action: Optional[str]
-
+    pending_chains: List[dict]
+    pending_chain: Optional[dict]
+    _next_action: str
     decision_log: List[str]
+    done: bool
+    step_count: int
+    chaining_enabled: bool
 
 
-def initial_state(target_url: str, max_steps: int = 20, chaining_enabled: bool = True) -> AgentState:
-    return AgentState(
-        target_url=target_url,
-        max_steps=max_steps,
-        chaining_enabled=chaining_enabled,
-        tech_stack={},
-        discovered_pages=[],
-        discovered_params=[],
-        findings=[],
-        auth_status={},
-        modules_run=[],
-        step_count=0,
-        pending_chain=None,
-        done=False,
-        decision_log=[],
-        _next_action=None,
-    )
+def initial_state(target_url: str, chaining_enabled: bool = True) -> AgentState:
+    return {
+        "target_url": target_url,
+        "tech_stack": {},
+        "pages": [],
+        "findings": [],
+        "modules_run": [],
+        "pending_chains": [],
+        "pending_chain": None,
+        "_next_action": "",
+        "decision_log": [],
+        "done": False,
+        "step_count": 0,
+        "chaining_enabled": chaining_enabled,
+    }
 
 
 def summarize_state(state: AgentState) -> str:
-    return f"""
-Target: {state['target_url']}
-Step: {state['step_count']}/{state['max_steps']}
-Tech stack known: {state['tech_stack'] or 'not yet fingerprinted'}
-Pages discovered: {len(state['discovered_pages'])}
-Modules already run: {state['modules_run'] or 'none yet'}
-Findings so far: {len(state['findings'])}
-Auth status: {'session obtained' if state['auth_status'].get('session_token') else 'no session yet'}
-Pending chain opportunity: {state['pending_chain']}
-""".strip()
+    lines = []
+
+    lines.append(f"Target: {state['target_url']}")
+
+    if state["tech_stack"]:
+        lines.append(
+            f"Tech stack identified: {state['tech_stack']}"
+        )
+
+    lines.append(
+        f"Modules already run: {state['modules_run'] or 'none yet'}"
+    )
+
+    lines.append(
+        f"Pending chains: {len(state['pending_chains'])}"
+    )
+
+    lines.append(
+        f"Total findings so far: {len(state['findings'])}"
+    )
+
+    return "\n".join(lines)
