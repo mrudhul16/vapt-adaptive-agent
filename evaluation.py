@@ -1,117 +1,202 @@
-import sys
 from agent import app
 from state import initial_state
 
+
 TARGET = "http://localhost:3000"
 
-def evaluate_mode(mode_name, chaining_enabled):
-    print(f"\n--- Running {mode_name} ---")
-    try:
-        state = initial_state(TARGET, chaining_enabled=chaining_enabled)
-        result = app.invoke(state)
-        
-        modules = result.get("modules_run", [])
-        steps = result.get("step_count", 0)
-        findings = result.get("findings", [])
-        decision_log = result.get("decision_log", [])
-        
-        vulnerabilities_confirmed = sum(
-            1 for f in findings 
-            if isinstance(f.get("data"), dict) and f["data"].get("vulnerable") is True
-        )
-        
-        idor_executed = "idor" in modules or "idor_check" in modules
-        
-        return {
-            "mode": mode_name,
-            "modules_run": modules,
-            "total_steps": steps,
-            "total_findings": len(findings),
-            "vulnerabilities_confirmed": vulnerabilities_confirmed,
-            "idor_executed": idor_executed,
-            "decision_log": decision_log,
-            "success": True
-        }
-    except Exception as e:
-        print(f"Error during {mode_name} evaluation: {e}")
-        return {
-            "mode": mode_name,
-            "success": False,
-            "error": str(e)
-        }
 
-def print_results(baseline, adaptive):
-    print("============================================================")
-    print("BASELINE vs ADAPTIVE EVALUATION")
-    print("============================================================")
-    
-    for run in (baseline, adaptive):
-        print(f"\n{run['mode']}")
-        if not run['success']:
-            print(f"FAILED: {run.get('error')}")
-            continue
-            
-        print(f"Modules Run: {', '.join(run['modules_run'])}")
-        print(f"Total Steps: {run['total_steps']}")
-        print(f"Total Findings: {run['total_findings']}")
-        print(f"Vulnerabilities Confirmed: {run['vulnerabilities_confirmed']}")
-        print(f"IDOR Executed: {'YES' if run['idor_executed'] else 'NO'}")
-        
-    print("\n------------------------------------------------------------")
-    print("BEHAVIORAL DIFFERENCE")
-    print("------------------------------------------------------------")
-    
-    if not baseline['success'] or not adaptive['success']:
-        print("Cannot compare due to failed run.")
-        return
-        
-    b_modules = set(baseline['modules_run'])
-    a_modules = set(adaptive['modules_run'])
-    extra_modules = a_modules - b_modules
-    
-    adaptive_extra_steps = adaptive['total_steps'] - baseline['total_steps']
-    adaptive_extra_modules = len(adaptive['modules_run']) - len(baseline['modules_run'])
-    
-    if extra_modules:
-        print(f"Modules executed ONLY in adaptive mode: {', '.join(extra_modules)}")
+def run_assessment(chaining_enabled):
+
+    state = initial_state(
+        TARGET,
+        chaining_enabled=chaining_enabled
+    )
+
+    final_state = app.invoke(state)
+
+    return final_state
+
+
+def get_summary(state):
+
+    return {
+        "modules_executed": len(
+            state["modules_run"]
+        ),
+
+        "workflow_steps": state[
+            "step_count"
+        ],
+
+        "findings": len(
+            state["findings"]
+        ),
+
+        "chains_triggered": state[
+            "metrics"
+        ]["chains_triggered"],
+
+        "chains_completed": state[
+            "metrics"
+        ]["chains_completed"],
+
+        "modules": state[
+            "modules_run"
+        ],
+
+        "chains": state[
+            "chain_history"
+        ]
+    }
+
+
+def print_summary(title, summary):
+
+    print("\n" + "=" * 60)
+    print(title)
+    print("=" * 60)
+
+    print(
+        f"Modules executed: "
+        f"{summary['modules_executed']}"
+    )
+
+    print(
+        f"Workflow steps: "
+        f"{summary['workflow_steps']}"
+    )
+
+    print(
+        f"Findings: "
+        f"{summary['findings']}"
+    )
+
+    print(
+        f"Chains triggered: "
+        f"{summary['chains_triggered']}"
+    )
+
+    print(
+        f"Chains completed: "
+        f"{summary['chains_completed']}"
+    )
+
+    print(
+        f"Modules: "
+        f"{summary['modules']}"
+    )
+
+    if summary["chains"]:
+
+        print("\nCompleted chains:")
+
+        for chain in summary["chains"]:
+
+            print(
+                f"  {chain.get('trigger')} "
+                f"→ "
+                f"{chain.get('next_module')}"
+            )
+
     else:
-        print("No additional modules executed in adaptive mode.")
-        
-    print(f"\nAdaptive extra modules count: {adaptive_extra_modules}")
-    print(f"Adaptive extra steps count: {adaptive_extra_steps}")
-    
-    chains = [entry for entry in adaptive['decision_log'] if "CHAINED" in entry or "chained" in entry.lower()]
-    if chains:
-        print("\nRelevant Adaptive Decision Log Entries:")
-        for c in chains:
-            print(f"- {c}")
-            
-    if adaptive['idor_executed'] and not baseline['idor_executed']:
-        print("\nAdaptive chaining caused IDOR to be executed after the preceding module produced an authenticated session.")
-        
-    print("\nMetric                  Baseline       Adaptive")
-    print("-" * 55)
-    
-    def pad(val, width=15):
-        return str(val).ljust(width)
-        
+
+        print(
+            "\nCompleted chains: None"
+        )
+
+
+def compare_results(baseline, adaptive):
+
+    print("\n" + "=" * 60)
+    print("BASELINE VS ADAPTIVE")
+    print("=" * 60)
+
     metrics = [
-        ("Modules Run", len(baseline['modules_run']), len(adaptive['modules_run'])),
-        ("Total Steps", baseline['total_steps'], adaptive['total_steps']),
-        ("Total Findings", baseline['total_findings'], adaptive['total_findings']),
-        ("IDOR Executed", "YES" if baseline['idor_executed'] else "NO", "YES" if adaptive['idor_executed'] else "NO"),
-        ("Vulnerabilities", baseline['vulnerabilities_confirmed'], adaptive['vulnerabilities_confirmed'])
+        ("Modules Executed", "modules_executed"),
+        ("Workflow Steps", "workflow_steps"),
+        ("Findings", "findings"),
+        ("Chains Triggered", "chains_triggered"),
+        ("Chains Completed", "chains_completed")
     ]
-    
-    for name, b_val, a_val in metrics:
-        print(f"{name.ljust(24)}{pad(b_val)}{pad(a_val)}")
+
+    print(
+        f"{'Metric':<25}"
+        f"{'Baseline':<15}"
+        f"{'Adaptive':<15}"
+    )
+
+    print("-" * 55)
+
+    for label, key in metrics:
+
+        print(
+            f"{label:<25}"
+            f"{baseline[key]:<15}"
+            f"{adaptive[key]:<15}"
+        )
+
 
 def main():
-    print("Starting evaluation...")
-    baseline_result = evaluate_mode("BASELINE (NO CHAINING)", False)
-    adaptive_result = evaluate_mode("ADAPTIVE (WITH CHAINING)", True)
-    
-    print_results(baseline_result, adaptive_result)
+
+    print("=" * 60)
+    print("VAPT ADAPTIVE AGENT EVALUATION")
+    print("=" * 60)
+
+    print(
+        f"\nTarget: {TARGET}"
+    )
+
+    print(
+        "\nRunning baseline assessment..."
+    )
+
+    baseline_state = run_assessment(
+        chaining_enabled=False
+    )
+
+    baseline = get_summary(
+        baseline_state
+    )
+
+    print_summary(
+        "BASELINE RESULTS",
+        baseline
+    )
+
+    print(
+        "\nRunning adaptive assessment..."
+    )
+
+    adaptive_state = run_assessment(
+        chaining_enabled=True
+    )
+
+    adaptive = get_summary(
+        adaptive_state
+    )
+
+    print_summary(
+        "ADAPTIVE RESULTS",
+        adaptive
+    )
+
+    compare_results(
+        baseline,
+        adaptive
+    )
+
+    print(
+        "\n" + "=" * 60
+    )
+
+    print(
+        "Evaluation complete."
+    )
+
+    print(
+        "=" * 60
+    )
+
 
 if __name__ == "__main__":
     main()
