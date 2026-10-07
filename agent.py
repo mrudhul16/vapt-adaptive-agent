@@ -952,12 +952,10 @@ def execute_module(
             state
         )
 
-        state[
-            "idor_state"
-        ].pop(
-            "authenticated_session",
-            None
-        )
+        if authenticated_session:
+            state["idor_state"][
+                "authenticated_session"
+            ] = authenticated_session
 
         return sanitize_session_from_result(
             result
