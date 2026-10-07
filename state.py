@@ -30,6 +30,14 @@ class AgentState(TypedDict):
 
     assessment_start_time: str
 
+    recon_state: Dict[str, Any]
+
+    xss_state: Dict[str, Any]
+
+    sqli_state: Dict[str, Any]
+
+    idor_state: Dict[str, Any]
+
 
 def initial_state(
     target_url: str,
@@ -68,7 +76,76 @@ def initial_state(
             "workflow_steps": 0
         },
 
-        "assessment_start_time": datetime.now().isoformat()
+        "assessment_start_time": datetime.now().isoformat(),
+
+        "recon_state": {
+            "discovered_targets": [],
+            "tested_targets": [],
+            "interesting_targets": [],
+            "remaining_targets": [],
+
+            "observations": [],
+
+            "technologies": [],
+            "endpoints": [],
+            "forms": [],
+            "parameters": [],
+
+            "api_endpoints": [],
+            "auth_endpoints": [],
+            "user_endpoints": [],
+            "transaction_endpoints": [],
+            "page_endpoints": [],
+            "js_assets": [],
+            "other_endpoints": [],
+
+            "attack_surface": {
+                "authentication": [],
+                "authorization": [],
+                "user_data": [],
+                "transactions": [],
+                "injection": [],
+                "client_side": [],
+                "other": []
+            },
+
+            "iteration": 0,
+            "completed": False
+        },
+
+        "xss_state": {
+            "discovered_targets": [],
+            "tested_targets": [],
+            "successful_targets": [],
+            "remaining_targets": [],
+            "observations": [],
+            "current_target": None,
+            "iteration": 0,
+            "completed": False
+        },
+
+        "sqli_state": {
+            "discovered_targets": [],
+            "tested_targets": [],
+            "successful_targets": [],
+            "remaining_targets": [],
+            "observations": [],
+            "current_target": None,
+            "iteration": 0,
+            "completed": False
+        },
+
+        "idor_state": {
+            "discovered_targets": [],
+            "tested_targets": [],
+            "successful_targets": [],
+            "remaining_targets": [],
+            "observations": [],
+            "current_target": None,
+            "iteration": 0,
+            "completed": False,
+            "authenticated_session": {}
+        }
     }
 
 
@@ -81,8 +158,10 @@ def summarize_state(state: AgentState) -> str:
     )
 
     if state["tech_stack"]:
+
         lines.append(
-            f"Tech stack identified: {state['tech_stack']}"
+            f"Tech stack identified: "
+            f"{state['tech_stack']}"
         )
 
     lines.append(
@@ -103,6 +182,28 @@ def summarize_state(state: AgentState) -> str:
     lines.append(
         f"Total findings so far: "
         f"{len(state['findings'])}"
+    )
+
+    recon = state.get("recon_state", {})
+
+    lines.append(
+        f"Recon targets discovered: "
+        f"{len(recon.get('discovered_targets', []))}"
+    )
+
+    lines.append(
+        f"Recon targets tested: "
+        f"{len(recon.get('tested_targets', []))}"
+    )
+
+    lines.append(
+        f"Recon endpoints discovered: "
+        f"{len(recon.get('endpoints', []))}"
+    )
+
+    lines.append(
+        f"Recon attack surface entries: "
+        f"{sum(len(v) for v in recon.get('attack_surface', {}).values())}"
     )
 
     lines.append(

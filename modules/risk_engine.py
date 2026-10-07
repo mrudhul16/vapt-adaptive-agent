@@ -32,12 +32,40 @@ def get_remediation(category: str) -> str:
     )
 
 
-def analyze_finding(finding: dict) -> dict:
+def is_vulnerable(finding: dict) -> bool:
+    if finding.get("vulnerable") is True:
+        return True
+
+    data = finding.get("data")
+
+    if isinstance(data, dict):
+        if data.get("vulnerable") is True:
+            return True
+
+        findings = data.get("findings")
+
+        if isinstance(findings, list) and len(findings) > 0:
+            return True
+
+    return False
+
+
+def analyze_finding(finding: dict) -> dict | None:
     category = str(
         finding.get("finding_type")
         or finding.get("category")
         or "unknown"
     ).lower()
+
+    if category in {"recon", "fingerprint", "crawl"}:
+        return {
+            "category": category,
+            "impact": get_impact(category),
+            "remediation": get_remediation(category),
+        }
+
+    if not is_vulnerable(finding):
+        return None
 
     return {
         "category": category,
@@ -47,4 +75,12 @@ def analyze_finding(finding: dict) -> dict:
 
 
 def analyze_all(findings: list) -> list:
-    return [analyze_finding(finding) for finding in findings]
+    risks = []
+
+    for finding in findings:
+        risk = analyze_finding(finding)
+
+        if risk is not None:
+            risks.append(risk)
+
+    return risks
