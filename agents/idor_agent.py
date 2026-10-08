@@ -2,16 +2,13 @@ import json
 import re
 
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+from groq_key_manager import get_llm
 
 
 load_dotenv()
 
 
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0
-)
+llm = get_llm("idor")
 
 
 SYSTEM_PROMPT = """
@@ -26,7 +23,7 @@ You must:
 1. Examine discovered IDOR targets.
 2. Check which targets were already tested.
 3. Analyze previous observations.
-4. Choose an unexplored target.
+4. Choose up to 5 unexplored targets.
 5. Prefer targets involving user-specific resources,
    object IDs, baskets, orders, profiles, or similar
    authorization boundaries.
@@ -44,7 +41,7 @@ Format:
 
 {
     "action": "test" or "finish",
-    "target_index": integer or null,
+    "target_indices": [0, 1, 2, 3, 4],
     "reason": "short explanation"
 }
 """
@@ -79,17 +76,12 @@ def choose_next_target(state):
                 "target": target
             })
 
-
     if not remaining_targets:
-
         return {
             "action": "finish",
-            "target_index": None,
-            "reason": (
-                "No unexplored IDOR targets remain."
-            )
+            "targets": [],
+            "reason": "No unexplored IDOR targets remain."
         }
-
 
     authenticated_session = (
         idor_state.get(
@@ -98,11 +90,11 @@ def choose_next_target(state):
         )
     )
 
-
     session_available = bool(
         authenticated_session
     )
 
+    BATCH_SIZE = 5
 
     prompt = f"""
 Target:
@@ -135,9 +127,9 @@ Previous observations:
     indent=2
 )}
 
-Choose the next IDOR target.
+Choose up to {BATCH_SIZE} of the next IDOR targets.
 
-Only select a target from the remaining targets.
+Only select targets from the remaining targets.
 
 Do not invent a target.
 
@@ -146,7 +138,6 @@ tool internally. Do not ask for or output the token.
 
 Return only JSON.
 """
-
 
     response = llm.invoke(
         [
@@ -161,10 +152,52 @@ Return only JSON.
         ]
     )
 
+    try:
+        decision = parse_decision(
+            response.content
+        )
+    except Exception:
+        decision = None
 
-    return parse_decision(
-        response.content
-    )
+    if decision is None:
+        selected_targets = [
+            t["target"] for t in remaining_targets[:BATCH_SIZE]
+        ]
+        return {
+            "action": "test",
+            "targets": selected_targets,
+            "reason": "Fallback to first remaining IDOR targets.",
+        }
+
+    if decision.get("action") == "finish":
+        return {
+            "action": "finish",
+            "targets": [],
+            "reason": decision.get("reason", "No unexplored IDOR targets remain.")
+        }
+
+    selected_targets = []
+    
+    for index in decision.get("target_indices", [])[:BATCH_SIZE]:
+        if not isinstance(index, int) or index < 0 or index >= len(discovered_targets):
+            continue
+            
+        target = discovered_targets[index]
+        selected_targets.append(target)
+
+    if not selected_targets:
+        selected_targets = [
+            t["target"] for t in remaining_targets[:BATCH_SIZE]
+        ]
+
+    return {
+        "action": "test",
+        "targets": selected_targets,
+        "reason": decision.get(
+            "reason",
+            "Selected by GPT-OSS."
+        )
+    }
 
 
 def parse_decision(response_text):

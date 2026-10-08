@@ -86,41 +86,48 @@ def main():
         )
 
         print()
-        print("GPT-OSS AUTHORIZATION DECISION")
+        print("GPT-OSS AUTHORIZATION BATCH DECISION")
         print("-" * 40)
         print(decision)
 
         if decision["action"] == "finish":
             break
 
-        target = decision["target"]
+        targets = decision.get("targets", [])
 
-        print()
-        print("AUTHORIZATION TARGET SELECTED")
-        print("-" * 40)
-        print(target)
+        if not targets:
+            break
 
-        result = execute_authorization_test(
-            state,
-            target
-        )
+        for target in targets:
+            if tests >= max_tests:
+                break
 
-        print()
-        print("AUTHORIZATION TEST RESULT")
-        print("-" * 40)
-        print(result)
+            print()
+            print("AUTHORIZATION TARGET SELECTED")
+            print("-" * 40)
+            print(target)
 
-        state = update_authorization_state(
-            state,
-            target,
-            result,
-            decision.get(
-                "reason",
-                "Authorization target selected."
-            ),
-        )
+            result = execute_authorization_test(
+                state,
+                target
+            )
 
-        tests += 1
+            print()
+            print("AUTHORIZATION TEST RESULT")
+            print("-" * 40)
+            print(result)
+
+            state = update_authorization_state(
+                state,
+                target,
+                result,
+                decision.get(
+                    "reason",
+                    "Authorization target selected."
+                ),
+            )
+
+            tests += 1
 
     state = finish_authorization_state(
         state

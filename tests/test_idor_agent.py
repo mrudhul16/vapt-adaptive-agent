@@ -177,8 +177,7 @@ print("=" * 40)
 
 
 targets = discover_idor_targets(
-    TARGET_URL,
-    authenticated_session
+    state
 )
 
 
@@ -233,15 +232,13 @@ while True:
     )
 
     print()
-    print("IDOR AGENT DECISION")
+    print("IDOR AGENT BATCH DECISION")
     print("=" * 40)
 
     print(decision)
 
 
-    if decision[
-        "action"
-    ] == "finish":
+    if decision.get("action") == "finish":
 
         state[
             "idor_state"
@@ -254,114 +251,82 @@ while True:
         print("=" * 40)
 
         print(
-            decision[
-                "reason"
-            ]
+            decision.get(
+                "reason",
+                "IDOR testing completed."
+            )
         )
 
         break
 
+    targets = decision.get("targets", [])
 
-    target_index = decision[
-        "target_index"
-    ]
+    if not targets:
+        break
 
-
-    if (
-        target_index is None
-        or target_index < 0
-        or target_index >= len(
-            state[
-                "idor_state"
-            ][
-                "discovered_targets"
-            ]
-        )
-    ):
-
+    for target in targets:
         print()
-        print("INVALID TARGET INDEX")
+        print("IDOR TARGET SELECTED")
         print("=" * 40)
 
-        break
+        print(target)
 
-
-    target = (
-        state[
-            "idor_state"
-        ][
-            "discovered_targets"
-        ][
-            target_index
-        ]
-    )
-
-
-    print()
-    print("IDOR TARGET SELECTED")
-    print("=" * 40)
-
-    print(target)
-
-
-    result = execute_idor_test(
-        state,
-        target
-    )
-
-
-    print()
-    print("IDOR TEST RESULT")
-    print("=" * 40)
-
-    # Do not print the authentication token.
-    safe_result = {
-        "success": result.get(
-            "success"
-        ),
-        "vulnerable": result.get(
-            "data",
-            {}
-        ).get(
-            "vulnerable"
-        ),
-        "status_code": result.get(
-            "data",
-            {}
-        ).get(
-            "status_code"
-        ),
-        "authenticated_request": result.get(
-            "data",
-            {}
-        ).get(
-            "authenticated_request"
-        ),
-        "unauthorized_access": result.get(
-            "data",
-            {}
-        ).get(
-            "unauthorized_access"
-        ),
-        "error": result.get(
-            "data",
-            {}
-        ).get(
-            "error"
+        result = execute_idor_test(
+            state,
+            target
         )
-    }
 
-    print(safe_result)
+        print()
+        print("IDOR TEST RESULT")
+        print("=" * 40)
 
+        safe_result = {
+            "success": result.get(
+                "success"
+            ),
+            "vulnerable": result.get(
+                "data",
+                {}
+            ).get(
+                "vulnerable"
+            ),
+            "status_code": result.get(
+                "data",
+                {}
+            ).get(
+                "status_code"
+            ),
+            "authenticated_request": result.get(
+                "data",
+                {}
+            ).get(
+                "authenticated_request"
+            ),
+            "unauthorized_access": result.get(
+                "data",
+                {}
+            ).get(
+                "unauthorized_access"
+            ),
+            "error": result.get(
+                "data",
+                {}
+            ).get(
+                "error"
+            )
+        }
 
-    update_idor_state(
-        state,
-        target,
-        result,
-        decision[
-            "reason"
-        ]
-    )
+        print(safe_result)
+
+        update_idor_state(
+            state,
+            target,
+            result,
+            decision.get(
+                "reason",
+                "Selected by GPT-OSS."
+            )
+        )
 
 
 # --------------------------------------------------

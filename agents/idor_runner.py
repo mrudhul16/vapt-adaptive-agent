@@ -58,75 +58,49 @@ def run_idor_specialist(state):
             "chain_data": None
         }
 
+    batch_queue = []
+
     for _ in range(MAX_ITERATIONS):
 
         if not idor_state["remaining_targets"]:
             break
 
-        decision = choose_next_target(state)
+        if not batch_queue:
+
+            decision = choose_next_target(state)
+
+            print()
+            print("GPT-OSS IDOR BATCH DECISION")
+            print("-" * 40)
+            print(decision)
+
+            if decision.get("action") == "finish":
+                break
+
+            batch_queue = decision.get(
+                "targets",
+                []
+            )
+
+            if not batch_queue:
+                break
+
+            reason = decision.get(
+                "reason",
+                "Selected by GPT-OSS."
+            )
+
+        target = batch_queue.pop(0)
+
+        if target not in idor_state[
+            "remaining_targets"
+        ]:
+            continue
 
         print()
-        print("GPT-OSS IDOR DECISION")
+        print("IDOR TARGET SELECTED")
         print("-" * 40)
-
-        print(decision)
-
-        if decision.get("action") == "finish":
-            break
-
-        target_index = decision.get(
-            "target_index"
-        )
-
-        if target_index is None:
-            break
-
-        discovered_targets = (
-            idor_state[
-                "discovered_targets"
-            ]
-        )
-
-        if (
-            not isinstance(
-                target_index,
-                int
-            )
-            or target_index < 0
-            or target_index >= len(
-                discovered_targets
-            )
-        ):
-
-            print(
-                "Invalid IDOR target selected."
-            )
-
-            break
-
-        target = (
-            discovered_targets[
-                target_index
-            ]
-        )
-
-        if target not in (
-            idor_state[
-                "remaining_targets"
-            ]
-        ):
-
-            print(
-                "GPT-OSS selected an "
-                "already tested target."
-            )
-
-            break
-
-        reason = decision.get(
-            "reason",
-            "Selected by GPT-OSS."
-        )
+        print(target)
 
         idor_state[
             "current_target"

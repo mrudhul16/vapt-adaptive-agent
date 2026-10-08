@@ -3,16 +3,13 @@ import re
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+from groq_key_manager import get_llm
 
 from tools.xss_tools import execute_xss_test
 
 load_dotenv()
 
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0
-)
+llm = get_llm("xss")
 
 MAX_XSS_TARGETS = 20
 BATCH_SIZE = 5

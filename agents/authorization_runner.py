@@ -192,36 +192,49 @@ def run_authorization_specialist(
 
     tests = 0
 
+    batch_queue = []
+
     while (
         authz_state.get("remaining_targets")
         and tests < MAX_AUTHORIZATION_TESTS
     ):
-        decision = choose_authorization_target(
-            authz_state
-        )
 
-        if decision.get("action") == "finish":
-            break
+        if not batch_queue:
 
-        target = decision.get("target")
+            decision = choose_authorization_target(
+                authz_state
+            )
+
+            if decision.get("action") == "finish":
+                break
+
+            batch_queue = decision.get(
+                "targets",
+                []
+            )
+
+            if not batch_queue:
+                break
+
+            reason = decision.get(
+                "reason",
+                "Authorization targets selected."
+            )
+
+            print()
+            print("GPT-OSS AUTHORIZATION BATCH DECISION")
+            print("-" * 40)
+
+            print({
+                "action": "test",
+                "targets_selected": len(batch_queue),
+                "reason": reason,
+            })
+
+        target = batch_queue.pop(0)
 
         if not target:
-            break
-
-        reason = decision.get(
-            "reason",
-            "Authorization target selected."
-        )
-
-        print()
-        print("GPT-OSS AUTHORIZATION DECISION")
-        print("-" * 40)
-
-        print({
-            "action": "test",
-            "target": target,
-            "reason": reason,
-        })
+            continue
 
         print()
         print("AUTHORIZATION TARGET SELECTED")

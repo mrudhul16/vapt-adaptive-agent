@@ -2,16 +2,13 @@ import json
 import re
 
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+from groq_key_manager import get_llm
 
 
 load_dotenv()
 
 
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0
-)
+llm = get_llm("authorization")
 
 
 SYSTEM_PROMPT = """
@@ -53,7 +50,7 @@ Your decision format must be:
 
 {
     "action": "test" or "finish",
-    "target_index": integer,
+    "target_indices": [0, 1, 2],
     "reason": "short explanation"
 }
 """
@@ -244,25 +241,34 @@ def parse_decision(response_text):
             return None
 
         if action == "test":
-            target_index = decision.get("target_index")
+            target_indices = decision.get(
+                "target_indices",
+                []
+            )
 
-            if not isinstance(target_index, int):
+            if not isinstance(target_indices, list):
                 return None
+
+            target_indices = [
+                index
+                for index in target_indices
+                if isinstance(index, int)
+            ]
 
             return {
                 "action": "test",
-                "target_index": target_index,
+                "target_indices": target_indices,
                 "reason": str(
                     decision.get(
                         "reason",
-                        "Authorization target selected."
+                        "Authorization targets selected."
                     )
                 ),
             }
 
         return {
             "action": "finish",
-            "target_index": -1,
+            "target_indices": [],
             "reason": str(
                 decision.get(
                     "reason",
@@ -283,10 +289,11 @@ def choose_authorization_target(authz_state):
     if not candidates:
         return {
             "action": "finish",
-            "target": None,
+            "targets": [],
             "reason": "No unexplored authorization targets remain.",
         }
 
+    BATCH_SIZE = 5
     max_candidates = 20
 
     llm_candidates = candidates[:max_candidates]
@@ -313,9 +320,34 @@ Candidate authorization targets:
 
 {candidate_text}
 
-Select the single most useful authorization target to test next.
+Select up to {BATCH_SIZE} of the most useful authorization targets
+to test next.
 
-Return JSON only.
+Prioritize:
+- admin endpoints
+- user-specific endpoints
+- profile/account endpoints
+- address endpoints
+- privileged APIs
+- sensitive user-data APIs
+
+Do not select already tested targets.
+
+Return JSON only:
+
+{{
+    "action": "test",
+    "target_indices": [0, 1, 2, 3, 4],
+    "reason": "short explanation"
+}}
+
+If no useful targets remain:
+
+{{
+    "action": "finish",
+    "target_indices": [],
+    "reason": "short explanation"
+}}
 """
 
     response = llm.invoke(prompt)
@@ -331,38 +363,63 @@ Return JSON only.
     )
 
     if decision is None:
-        decision = {
+        selected_targets = llm_candidates[:BATCH_SIZE]
+
+        return {
             "action": "test",
-            "target_index": 0,
-            "reason": "Fallback to highest-priority authorization target.",
+            "targets": selected_targets,
+            "reason": "Fallback to highest-priority authorization targets.",
         }
 
     if decision["action"] == "finish":
         return {
             "action": "finish",
-            "target": None,
+            "targets": [],
             "reason": decision["reason"],
         }
 
-    selected_index = decision["target_index"]
+    selected_targets = []
 
-    if (
-        selected_index < 0
-        or selected_index >= len(llm_candidates)
-    ):
-        selected_index = 0
+    for index in decision.get(
+        "target_indices",
+        []
+    )[:BATCH_SIZE]:
 
-    selected_target = llm_candidates[
-        selected_index
-    ]
+        if index < 0 or index >= len(llm_candidates):
+            continue
 
-    selected_target = dict(selected_target)
-    selected_target.pop("_priority", None)
+        target = llm_candidates[index]
+
+        clean_target = dict(target)
+
+        clean_target.pop(
+            "_priority",
+            None
+        )
+
+        selected_targets.append(
+            clean_target
+        )
+
+    if not selected_targets:
+        selected_targets = [
+            dict(target)
+            for target in llm_candidates[:BATCH_SIZE]
+        ]
+
+        for target in selected_targets:
+            target.pop(
+                "_priority",
+                None
+            )
 
     return {
         "action": "test",
-        "target": selected_target,
-        "reason": decision["reason"],
+        "targets": selected_targets,
+        "reason": decision.get(
+            "reason",
+            "Authorization targets selected by GPT-OSS."
+        ),
     }
 
 

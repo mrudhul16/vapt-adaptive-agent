@@ -2,7 +2,7 @@ import json
 import re
 
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+from groq_key_manager import get_llm
 
 from state import initial_state
 
@@ -23,10 +23,7 @@ from modules.risk_engine import analyze_all
 load_dotenv()
 
 
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0
-)
+llm = get_llm("orchestrator")
 
 
 CORE_MODULES = [
@@ -390,11 +387,37 @@ def run_xss_specialist(
             ""
         )
 
-        if action == "finish":
+        discovered = xss_state[
+            "discovered_targets"
+        ]
+
+        tested = xss_state[
+            "tested_targets"
+        ]
+
+        remaining = [
+            index
+            for index, target in enumerate(discovered)
+            if target not in tested
+        ]
+
+        if not remaining:
             break
 
+        if action == "finish":
+            target_index = remaining[0]
+            reason = (
+                "GPT requested finish while unexplored "
+                "XSS targets remained. Continuing with "
+                "the next unexplored target."
+            )
+
         if target_index is None:
-            break
+            target_index = remaining[0]
+            reason = (
+                "No valid target was selected. Continuing "
+                "with the next unexplored XSS target."
+            )
 
         try:
             target_index = int(
@@ -405,28 +428,28 @@ def run_xss_specialist(
             TypeError,
             ValueError
         ):
-            break
-
-        discovered = xss_state[
-            "discovered_targets"
-        ]
+            target_index = remaining[0]
+            reason = (
+                "Invalid target index returned by GPT. "
+                "Continuing with the next unexplored target."
+            )
 
         if (
             target_index < 0
             or target_index >= len(
                 discovered
             )
+            or discovered[target_index] in tested
         ):
-            break
+            target_index = remaining[0]
+            reason = (
+                "GPT selected an invalid or already-tested "
+                "target. Continuing with the next unexplored target."
+            )
 
         target = discovered[
             target_index
         ]
-
-        if target in xss_state[
-            "tested_targets"
-        ]:
-            continue
 
         xss_state[
             "current_target"
@@ -448,38 +471,88 @@ def run_xss_specialist(
         ) == 0
     )
 
+    print(
+        "\nXSS Specialist Status:",
+        "COMPLETED"
+        if xss_state["completed"]
+        else "INCOMPLETE"
+    )
+
+    print(
+        "Targets discovered:",
+        len(
+            xss_state[
+                "discovered_targets"
+            ]
+        )
+    )
+
+    print(
+        "Targets tested:",
+        len(
+            xss_state[
+                "tested_targets"
+            ]
+        )
+    )
+
+    print(
+        "Successful targets:",
+        len(
+            xss_state[
+                "successful_targets"
+            ]
+        )
+    )
+
+    print(
+        "Remaining targets:",
+        len(
+            xss_state[
+                "remaining_targets"
+            ]
+        )
+    )
+
     return {
         "specialist": "xss",
+
         "target_count": len(
             xss_state[
                 "discovered_targets"
             ]
         ),
+
         "tested_count": len(
             xss_state[
                 "tested_targets"
             ]
         ),
+
         "successful_count": len(
             xss_state[
                 "successful_targets"
             ]
         ),
+
         "remaining_count": len(
             xss_state[
                 "remaining_targets"
             ]
         ),
+
         "findings": list(
             xss_state[
                 "successful_targets"
             ]
         ),
+
         "observations": list(
             xss_state[
                 "observations"
             ]
         ),
+
         "completed": xss_state[
             "completed"
         ],
@@ -1012,66 +1085,129 @@ def update_state_after_module(
     result,
     reason
 ):
-
     result = sanitize_session_from_result(
         result
     )
 
-    finding = {
-        "finding_type": action,
-        "category": action,
-        "vulnerable": False,
-        "data": result,
+    if not isinstance(result, dict):
+        result = {
+            "specialist": action,
+            "completed": False,
+            "error": "Invalid module result."
+        }
+
+    category_map = {
+        "xss_check": "xss",
+        "sqli_check": "sqli",
+        "idor_check": "idor",
+        "authorization": "auth",
+        "auth": "auth",
+        "recon": "recon"
     }
 
-    if result.get(
-        "vulnerable"
-    ) is True:
-
-        finding[
-            "vulnerable"
-        ] = True
-
-    data = result.get(
-        "data"
+    canonical_category = category_map.get(
+        action,
+        action
     )
 
-    if isinstance(
-        data,
-        dict
-    ):
+    findings_to_add = []
 
-        if data.get(
-            "vulnerable"
-        ) is True:
+    module_finding = {
+        "finding_type": canonical_category,
+        "category": canonical_category,
+        "vulnerable": False,
+        "data": result
+    }
 
-            finding[
-                "vulnerable"
-            ] = True
+    if result.get("vulnerable") is True:
+        module_finding["vulnerable"] = True
+
+    data = result.get("data")
+
+    if isinstance(data, dict):
+
+        if data.get("vulnerable") is True:
+            module_finding["vulnerable"] = True
 
         if isinstance(
-            data.get(
-                "findings"
-            ),
+            data.get("findings"),
             list
         ):
-
-            finding[
-                "findings"
-            ] = data[
+            module_finding["findings"] = data[
                 "findings"
             ]
 
-    state[
-        "findings"
-    ].append(
-        finding
+    findings_to_add.append(
+        module_finding
     )
+
+    successful_targets = result.get(
+        "findings"
+    )
+
+    if not isinstance(
+        successful_targets,
+        list
+    ):
+        successful_targets = []
+
+    if not successful_targets and isinstance(
+        data,
+        dict
+    ):
+        successful_targets = data.get(
+            "successful_targets",
+            []
+        )
+
+    for target in successful_targets:
+
+        if not isinstance(
+            target,
+            dict
+        ):
+            continue
+
+        finding = dict(target)
+
+        finding["finding_type"] = (
+            category_map.get(
+                finding.get("finding_type"),
+                finding.get("finding_type")
+            )
+            or canonical_category
+        )
+
+        finding["category"] = (
+            category_map.get(
+                finding.get("category"),
+                finding.get("category")
+            )
+            or canonical_category
+        )
+
+        if "vulnerable" not in finding:
+            finding["vulnerable"] = True
+
+        findings_to_add.append(
+            finding
+        )
+
+    for finding in findings_to_add:
+
+        finding = sanitize_session_from_result(
+            finding
+        )
+
+        state[
+            "findings"
+        ].append(
+            finding
+        )
 
     if action not in state[
         "modules_run"
     ]:
-
         state[
             "modules_run"
         ].append(
@@ -1380,13 +1516,16 @@ def run_agent(
                 state
             )
 
-    state[
-        "risk_assessments"
-    ] = analyze_all(
-        state[
-            "findings"
-        ]
-    )
+    raw_risks = analyze_all(state["findings"])
+    unique_risks = []
+    seen_categories = set()
+    for risk in raw_risks:
+        category = risk.get("category")
+        if category in seen_categories:
+            continue
+        seen_categories.add(category)
+        unique_risks.append(risk)
+    state["risk_assessments"] = unique_risks
 
     print(
         "\n" + "=" * 70

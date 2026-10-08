@@ -2,16 +2,13 @@ import json
 import re
 
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+from groq_key_manager import get_llm
 
 
 load_dotenv()
 
 
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0
-)
+llm = get_llm("recon")
 
 
 SYSTEM_PROMPT = """
