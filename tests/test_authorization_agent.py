@@ -162,7 +162,21 @@ def main():
     print(
         "Findings:",
         len(
-            state["findings"]
+            state.get("findings", [])
+        )
+    )
+
+    print(
+        "Suspected targets:",
+        len(
+            state.get("successful_targets", [])
+        )
+    )
+
+    print(
+        "Confirmed targets:",
+        len(
+            state.get("confirmed_vulnerabilities", [])
         )
     )
 

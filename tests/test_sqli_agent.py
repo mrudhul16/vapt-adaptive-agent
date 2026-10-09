@@ -14,7 +14,7 @@ from state import initial_state
 
 from agents.sqli_agent import (
     choose_next_target,
-    test_selected_target
+    test_selected_target as _test_selected_target
 )
 
 from tools.sqli_tools import get_sqli_targets
@@ -105,7 +105,7 @@ while True:
         "discovered_targets"
     ][target_index]
 
-    test_selected_target(
+    _test_selected_target(
         state,
         target,
         decision["reason"]

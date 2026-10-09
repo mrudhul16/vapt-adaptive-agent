@@ -472,92 +472,46 @@ def choose_next_targets(recon_state):
         :MAX_LLM_CANDIDATES
     ]
 
+    # Compact candidate list (no indentation); the candidate set already
+    # excludes tested targets, so tested lists / full observations are omitted.
     candidate_text = json.dumps(
-        format_candidates(
-            llm_candidates
-        ),
-        indent=2,
-        ensure_ascii=True
+        format_candidates(llm_candidates),
+        separators=(",", ":"),
+        ensure_ascii=True,
     )
 
-    tested_targets = recon_state.get(
-        "tested_targets",
-        []
-    )
+    tested_count = len(recon_state.get("tested_targets", []))
 
-    observations = recon_state.get(
-        "observations",
-        []
-    )
-
-    prompt = f"""
-Target:
-
-{recon_state.get(
-    "target_url",
-    "http://localhost:3000"
-)}
-
-There are currently
-{len(candidates)}
-meaningful unexplored targets.
-
-You MUST select targets.
-
-Candidate targets:
-
+    prompt = f"""Recon target discovery. Target: {recon_state.get("target_url", "http://localhost:3000")}
+{len(candidates)} unexplored candidate targets ({tested_count} already tested). You MUST select targets.
+Candidates (choose up to 5 by "index"):
 {candidate_text}
-
-Already tested:
-
-{json.dumps(
-    tested_targets[-20:],
-    indent=2,
-    ensure_ascii=True
-)}
-
-Recent observations:
-
-{json.dumps(
-    observations[-10:],
-    indent=2,
-    ensure_ascii=True
-)}
-
-Choose up to 5 targets.
-
-IMPORTANT:
-
-If candidates exist, DO NOT return finish.
-
-Return ONLY JSON:
-
-{{
-    "action": "test",
-    "target_indices": [0, 1, 2],
-    "reason": "short explanation"
-}}
-"""
-
-    response = llm.invoke(
-        [
-            (
-                "system",
-                SYSTEM_PROMPT
-            ),
-            (
-                "human",
-                prompt
-            ),
-        ]
-    )
+If candidates exist, do not finish.
+Return ONLY JSON: {{"action":"test","target_indices":[0,1,2],"reason":"short explanation"}}"""
 
     try:
+        response = llm.invoke(
+            [
+                (
+                    "system",
+                    SYSTEM_PROMPT
+                ),
+                (
+                    "human",
+                    prompt
+                ),
+            ]
+        )
         decision = parse_decision(
             response.content
         )
-
-    except Exception:
+    except Exception as e:
+        print(f"[RECON] GPT decision failed: {e}")
+        decision = {
+            "action": "test",
+            "target_indices": [0],
+            "reason": "Fallback selection due to API error."
+        }
         decision = fallback_selection(
             candidates
         )

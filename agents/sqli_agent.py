@@ -100,17 +100,24 @@ Return only JSON.
 """
 
 
-    response = llm.invoke(
-        [
-            ("system", SYSTEM_PROMPT),
-            ("human", prompt)
-        ]
-    )
-
-
-    return parse_decision(
-        response.content
-    )
+    try:
+        response = llm.invoke(
+            [
+                ("system", SYSTEM_PROMPT),
+                ("human", prompt)
+            ]
+        )
+        return parse_decision(
+            response.content
+        )
+    except Exception as e:
+        print(f"[SQLI] GPT decision failed: {e}")
+        # Fallback to testing the first untested target
+        return {
+            "action": "test",
+            "target_index": remaining_targets[0]["index"],
+            "reason": "Local fallback target selection."
+        }
 
 
 def parse_decision(response_text):
@@ -234,22 +241,18 @@ def update_sqli_state(
     )
 
 
-    if result.get(
-        "data",
-        {}
-    ).get(
-        "vulnerable"
-    ):
+    data = result.get("data", {})
 
-        if target not in sqli_state[
-            "successful_targets"
-        ]:
+    if data.get("vulnerable") is True:
+        if target not in sqli_state["successful_targets"]:
+            sqli_state["successful_targets"].append(target)
 
-            sqli_state[
-                "successful_targets"
-            ].append(
-                target
-            )
+    if data.get("confirmed") is True:
+        confirmed = sqli_state.setdefault(
+            "confirmed_vulnerabilities", []
+        )
+        if target not in confirmed:
+            confirmed.append(target)
 
 
     sqli_state["remaining_targets"] = [

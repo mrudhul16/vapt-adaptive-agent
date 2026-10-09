@@ -329,6 +329,75 @@ st.markdown("""
     }
     .landing-card h3 { margin: 0 0 8px; font-size: 1rem; }
     .landing-card p { margin: 0; font-size: 0.85rem; color: #94A3B8; line-height: 1.5; }
+
+    /* ---- Findings & Evidence cards ---- */
+    .ev-card {
+        background: rgba(15, 23, 42, 0.6);
+        border: 1px solid rgba(255,255,255,0.06);
+        border-left: 4px solid rgba(148,163,184,0.5);
+        border-radius: 12px;
+        padding: 18px 22px;
+        margin-bottom: 14px;
+    }
+    .ev-card.sev-critical { border-left-color: #F87171; }
+    .ev-card.sev-high     { border-left-color: #FB923C; }
+    .ev-card.sev-medium   { border-left-color: #FBBF24; }
+    .ev-card.sev-low      { border-left-color: #60A5FA; }
+    .ev-card.sev-info     { border-left-color: #9CA3AF; }
+    .ev-head {
+        display: flex; align-items: center; gap: 10px;
+        flex-wrap: wrap; margin-bottom: 4px;
+    }
+    .ev-title { font-size: 1rem; font-weight: 600; color: #F8FAFC; margin: 0; }
+    .ev-module {
+        font-size: 0.65rem; color: #64748B; text-transform: uppercase;
+        letter-spacing: 1.5px; font-weight: 600; margin-left: auto;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    .ev-endpoint {
+        font-family: 'JetBrains Mono', monospace; font-size: 0.8rem;
+        color: #93C5FD; background: rgba(59,130,246,0.07);
+        border: 1px solid rgba(59,130,246,0.12); border-radius: 6px;
+        padding: 4px 10px; margin: 8px 0 10px; display: inline-block;
+        word-break: break-all;
+    }
+    .ev-summary { font-size: 0.85rem; color: #94A3B8; line-height: 1.6; margin-bottom: 12px; }
+    .ev-grid {
+        display: grid; grid-template-columns: 180px 1fr; gap: 6px 16px;
+        font-size: 0.82rem; margin-top: 8px;
+    }
+    .ev-k { color: #64748B; font-weight: 500; }
+    .ev-v { color: #E2E8F0; font-family: 'JetBrains Mono', monospace; word-break: break-word; }
+    .ev-chip {
+        display: inline-block; font-family: 'JetBrains Mono', monospace;
+        font-size: 0.72rem; padding: 2px 8px; border-radius: 5px; margin: 2px 4px 2px 0;
+    }
+    .ev-chip.src { background: rgba(249,115,22,0.1); color: #FDBA74; border: 1px solid rgba(249,115,22,0.2); }
+    .ev-chip.snk { background: rgba(239,68,68,0.1); color: #FCA5A5; border: 1px solid rgba(239,68,68,0.2); }
+    .status-chip {
+        display: inline-block; padding: 3px 10px; border-radius: 6px;
+        font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+    }
+    .status-confirmed { background: rgba(239,68,68,0.15); color: #F87171; border: 1px solid rgba(239,68,68,0.25); }
+    .status-suspected { background: rgba(245,158,11,0.15); color: #FBBF24; border: 1px solid rgba(245,158,11,0.25); }
+    .status-potential { background: rgba(59,130,246,0.15); color: #60A5FA; border: 1px solid rgba(59,130,246,0.25); }
+    .status-info      { background: rgba(107,114,128,0.12); color: #9CA3AF; border: 1px solid rgba(107,114,128,0.2); }
+    .ev-empty {
+        text-align: center; padding: 40px; color: #475569;
+        border: 1px dashed rgba(255,255,255,0.08); border-radius: 12px;
+    }
+    .sev-summary-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+    .sev-pill {
+        flex: 1; min-width: 110px; text-align: center; padding: 14px 10px;
+        border-radius: 12px; background: rgba(15,23,42,0.6); border: 1px solid rgba(255,255,255,0.06);
+    }
+    .sev-pill .num { font-size: 1.8rem; font-weight: 700; line-height: 1; font-family: 'Outfit', sans-serif; }
+    .sev-pill .lbl { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 1.5px; color: #64748B; margin-top: 6px; }
+    .sev-pill.c-critical .num { color: #F87171; }
+    .sev-pill.c-high .num { color: #FB923C; }
+    .sev-pill.c-medium .num { color: #FBBF24; }
+    .sev-pill.c-low .num { color: #60A5FA; }
+    .sev-pill.c-potential .num { color: #A78BFA; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -452,6 +521,243 @@ def safe_get_list_len(data, key, default=0):
     if isinstance(val, list):
         return len(val)
     return default
+
+
+# ------------------------------------------------------------
+# Findings & Evidence normalization
+# ------------------------------------------------------------
+_SEV = {
+    "sqli": ("CRITICAL", "sev-critical"),
+    "idor": ("HIGH", "sev-high"),
+    "xss": ("MEDIUM", "sev-medium"),
+    "auth": ("LOW", "sev-low"),
+    "authorization": ("LOW", "sev-low"),
+}
+
+
+def _d(obj):
+    return obj if isinstance(obj, dict) else {}
+
+
+def build_evidence_findings(state):
+    """Normalize all module results into professional, evidence-backed cards.
+
+    Defensive by design: unknown shapes simply produce fewer cards (the raw
+    JSON expander remains available as a fallback). Secrets are never surfaced.
+    """
+    findings = state.get("findings", []) or []
+    xss_state = _d(state.get("xss_state"))
+    idor_state = _d(state.get("idor_state"))
+    items = []
+
+    # ---- SQL Injection (module-level) ----
+    for f in findings:
+        ft = str(f.get("finding_type") or f.get("category") or "").lower()
+        if ft != "sqli":
+            continue
+        data = _d(f.get("data"))
+        if not (f.get("vulnerable") or data.get("vulnerable")):
+            continue
+        confirmed = data.get("confirmed") is True
+        bypass = data.get("authentication_bypass_verified") is True
+        payload = None
+        for obs in data.get("observations", []) or []:
+            if isinstance(obs, dict) and obs.get("authentication_bypass_verified"):
+                payload = obs.get("payload")
+                break
+        ev = []
+        if payload:
+            ev.append(("Injection payload", payload))
+        ev.append((
+            "Authentication bypass",
+            "Verified — benign control failed while the injection authenticated"
+            if bypass else "Not independently verified",
+        ))
+        if data.get("auth_token_source"):
+            ev.append(("Session token obtained via",
+                       f"{data.get('auth_token_source')} (value redacted)"))
+        tgt = _d(data.get("target"))
+        items.append({
+            "title": "SQL Injection — Authentication Bypass",
+            "module": "SQL Injection",
+            "sev": _SEV["sqli"],
+            "status": ("CONFIRMED", "status-confirmed") if confirmed
+            else ("SUSPECTED", "status-suspected"),
+            "endpoint": tgt.get("url") or state.get("target_url", ""),
+            "summary": data.get("detail", ""),
+            "evidence": ev,
+        })
+        break
+
+    # ---- IDOR (individual findings with an ownership mismatch) ----
+    idor_rows, auth_user = [], None
+    for f in findings:
+        ft = str(f.get("finding_type") or f.get("category") or "").lower()
+        if ft != "idor":
+            continue
+        data = _d(f.get("data"))
+        if not (data.get("ownership_mismatch") or data.get("unauthorized_access")):
+            continue
+        tgt = _d(data.get("target"))
+        auth_user = data.get("authenticated_user_id", auth_user)
+        idor_rows.append({
+            "Resource": tgt.get("url") or data.get("url") or "—",
+            "Object ID": data.get("object_id") or tgt.get("object_id") or "—",
+            "Owner (User)": data.get("resource_owner_id", "—"),
+            "Accessed as (User)": data.get("authenticated_user_id", "—"),
+            "HTTP": data.get("status_code", "—"),
+        })
+    if idor_rows:
+        items.append({
+            "title": "IDOR — Unauthorized Cross-User Resource Access",
+            "module": "IDOR",
+            "sev": _SEV["idor"],
+            "status": ("CONFIRMED", "status-confirmed"),
+            "endpoint": "/rest/basket/{id}",
+            "summary": (
+                f"An authenticated user (ID {auth_user}) retrieved "
+                f"{len(idor_rows)} resource(s) owned by other users."
+            ),
+            "evidence": [],
+            "table": idor_rows,
+        })
+
+    # ---- XSS confirmed ----
+    for t in xss_state.get("confirmed_vulnerabilities", []) or []:
+        t = _d(t)
+        if not t:
+            continue
+        items.append({
+            "title": "Cross-Site Scripting — Confirmed Execution",
+            "module": "XSS",
+            "sev": _SEV["xss"],
+            "status": ("CONFIRMED", "status-confirmed"),
+            "endpoint": t.get("url", ""),
+            "summary": "Payload execution was observed (expected dialog triggered) during live testing.",
+            "evidence": [
+                ("Vector type", t.get("xss_target_type", "—")),
+                ("Parameter", t.get("parameter") or "—"),
+            ],
+        })
+
+    # ---- XSS potential (static DOM analysis, detection-only) ----
+    for p in xss_state.get("potential_findings", []) or []:
+        p = _d(p)
+        if not p:
+            continue
+        ev_block = _d(p.get("evidence"))
+        items.append({
+            "title": p.get("vulnerability_type", "Potential DOM-based XSS"),
+            "module": "XSS",
+            "sev": ("MEDIUM", "sev-medium"),
+            "status": ("POTENTIAL", "status-potential"),
+            "endpoint": p.get("endpoint", ""),
+            "summary": p.get("detail", ""),
+            "evidence": [
+                ("Confirmation", p.get("confirmation",
+                 "Not established by static analysis alone.")),
+            ],
+            "sources": p.get("sources") or ev_block.get("sources") or [],
+            "sinks": p.get("sinks") or ev_block.get("sinks") or [],
+        })
+
+    # ---- XSS suspected ----
+    for t in xss_state.get("successful_targets", []) or []:
+        t = _d(t)
+        if not t:
+            continue
+        items.append({
+            "title": "Cross-Site Scripting — Suspected",
+            "module": "XSS",
+            "sev": _SEV["xss"],
+            "status": ("SUSPECTED", "status-suspected"),
+            "endpoint": t.get("url", ""),
+            "summary": "Reflected/stored behavior suggests XSS, but execution was not confirmed.",
+            "evidence": [
+                ("Vector type", t.get("xss_target_type", "—")),
+                ("Parameter", t.get("parameter") or "—"),
+            ],
+        })
+
+    # ---- Auth / Authorization (individual, evidence-backed findings) ----
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        ft = str(f.get("finding_type") or f.get("category") or "").lower()
+        data = _d(f.get("data"))
+        is_authz = ft in ("auth", "authorization")
+        vulnerable = f.get("vulnerable") or data.get("vulnerable")
+        endpoint = f.get("endpoint") or _d(data.get("target")).get("url")
+        if not (is_authz and vulnerable and endpoint):
+            continue
+
+        evidence_blob = _d(f.get("evidence")) or data
+        enumeration = _d(evidence_blob.get("enumeration"))
+        disclosed = (
+            evidence_blob.get("disclosed_for")
+            or enumeration.get("disclosed_for")
+            or []
+        )
+        detail = f.get("detail") or data.get("detail", "")
+
+        if disclosed:
+            title = "Authentication — User Enumeration"
+            ev = [("Accounts enumerated", ", ".join(map(str, disclosed)))]
+        elif data.get("multiple_user_records_exposed"):
+            title = "Authorization — Excessive Data Exposure"
+            ev = [("Indicators", ", ".join(data.get("indicators", []) or []) or "—")]
+        else:
+            title = "Authorization / Authentication Weakness"
+            ev = [("Indicators", ", ".join(data.get("indicators", []) or []) or "—")]
+
+        items.append({
+            "title": title,
+            "module": "Authorization" if ft == "authorization" else "Authentication",
+            "sev": _SEV.get(ft, ("LOW", "sev-low")),
+            "status": ("SUSPECTED", "status-suspected"),
+            "endpoint": endpoint,
+            "summary": detail,
+            "evidence": ev,
+        })
+
+    return items
+
+
+def render_evidence_card(item):
+    esc = html_module.escape
+    sev_label, sev_cls = item["sev"]
+    st_label, st_cls = item["status"]
+
+    parts = [f'<div class="ev-card {sev_cls}">']
+    parts.append('<div class="ev-head">')
+    parts.append(f'<span class="status-chip {st_cls}">{esc(st_label)}</span>')
+    parts.append(f'<span class="badge {("badge-"+sev_cls.split("-")[1])}">{esc(sev_label)}</span>')
+    parts.append(f'<span class="ev-title">{esc(item["title"])}</span>')
+    parts.append(f'<span class="ev-module">{esc(item["module"])}</span>')
+    parts.append('</div>')
+
+    if item.get("endpoint"):
+        parts.append(f'<div class="ev-endpoint">{esc(str(item["endpoint"]))}</div>')
+    if item.get("summary"):
+        parts.append(f'<div class="ev-summary">{esc(str(item["summary"]))}</div>')
+
+    rows = item.get("evidence") or []
+    if rows:
+        parts.append('<div class="ev-grid">')
+        for k, v in rows:
+            parts.append(f'<div class="ev-k">{esc(str(k))}</div><div class="ev-v">{esc(str(v))}</div>')
+        parts.append('</div>')
+
+    if item.get("sources") or item.get("sinks"):
+        parts.append('<div style="margin-top:10px;">')
+        for s in item.get("sources", []):
+            parts.append(f'<span class="ev-chip src">source: {esc(str(s))}</span>')
+        for s in item.get("sinks", []):
+            parts.append(f'<span class="ev-chip snk">sink: {esc(str(s))}</span>')
+        parts.append('</div>')
+
+    parts.append('</div>')
+    st.markdown("".join(parts), unsafe_allow_html=True)
 
 
 # ============================================================
@@ -598,6 +904,7 @@ recon_state = state.get("recon_state", {})
 sqli_state = state.get("sqli_state", {})
 xss_state = state.get("xss_state", {})
 idor_state = state.get("idor_state", {})
+authz_state = state.get("authz_state", {})
 chain_history = state.get("chain_history", [])
 step_count = state.get("step_count", 0)
 target_display = state.get("target_url", target_url)
@@ -923,37 +1230,119 @@ if "xss_check" in modules:
     with st.expander("Cross-Site Scripting (XSS)", expanded=False):
         st.markdown(f"**Purpose:** {MODULE_PURPOSE.get('xss_check', '')}")
 
-        xc1, xc2, xc3 = st.columns(3)
+        # Distinct count kinds (never mixed): raw recon endpoints -> expanded
+        # candidates -> candidates analyzed -> endpoints still unclassified.
+        xc1, xc2, xc3, xc4 = st.columns(4)
         with xc1:
-            st.metric("Targets Discovered", safe_get_list_len(xss_state, "discovered_targets"))
+            st.metric("Raw Endpoints", safe_get_list_len(xss_state, "recon_targets"))
         with xc2:
-            st.metric("Targets Tested", safe_get_list_len(xss_state, "tested_targets"))
+            st.metric("XSS Candidates", safe_get_list_len(xss_state, "candidate_pool"))
         with xc3:
-            st.metric("Successful", safe_get_list_len(xss_state, "successful_targets"))
+            st.metric("Analyzed", safe_get_list_len(xss_state, "tested_targets"))
+        with xc4:
+            st.metric("Unclassified", safe_get_list_len(xss_state, "unclassified_targets"))
+
+        xd1, xd2, xd3 = st.columns(3)
+        with xd1:
+            st.metric("Potential (unverified)", safe_get_list_len(xss_state, "potential_findings"))
+        with xd2:
+            st.metric("Suspected", safe_get_list_len(xss_state, "successful_targets"))
+        with xd3:
+            st.metric("Confirmed", safe_get_list_len(xss_state, "confirmed_vulnerabilities"))
 
         xss_findings = [f for f in findings if f.get("finding_type") == "xss"]
         xss_vuln = any(is_finding_vulnerable(f) for f in xss_findings)
+        potential = (
+            xss_state.get("potential_findings", [])
+            if isinstance(xss_state, dict)
+            else []
+        )
 
         if xss_vuln:
             st.markdown("**Result:** <span class='badge badge-medium'>FINDINGS DETECTED</span>", unsafe_allow_html=True)
-            st.warning("Cross-site scripting behavior was detected in one or more endpoints.")
+            st.warning("Confirmed cross-site scripting behavior was detected in one or more endpoints.")
+        elif potential:
+            st.markdown("**Result:** <span class='badge badge-info'>POTENTIAL FINDINGS</span>", unsafe_allow_html=True)
+            st.info("Potential XSS leads were detected by static analysis. These are unverified and require manual confirmation before being treated as vulnerabilities.")
         else:
             st.markdown("**Result:** <span class='badge badge-pass'>PASS</span>", unsafe_allow_html=True)
             st.caption("No confirmed XSS vulnerabilities were identified.")
+
+        # Detection-only: show each potential finding's endpoint and evidence.
+        if potential:
+            table_data = []
+            for p in potential:
+                if not isinstance(p, dict):
+                    continue
+                evidence = p.get("evidence", {}) if isinstance(p.get("evidence"), dict) else {}
+                sources = p.get("sources") or evidence.get("sources") or []
+                sinks = p.get("sinks") or evidence.get("sinks") or []
+                table_data.append({
+                    "Endpoint": p.get("endpoint", ""),
+                    "Type": p.get("vulnerability_type", "Potential DOM-based XSS"),
+                    "Status": p.get("status", "potential"),
+                    "Sources": ", ".join(sources) if isinstance(sources, list) else str(sources),
+                    "Sinks": ", ".join(sinks) if isinstance(sinks, list) else str(sinks),
+                })
+            if table_data:
+                st.caption("Potential XSS findings (detection-only; not confirmed by static analysis):")
+                st.table(table_data)
 
 # -- AUTHORIZATION --
 if "authorization" in modules:
     with st.expander("Authorization", expanded=False):
         st.markdown(f"**Purpose:** {MODULE_PURPOSE.get('authorization', '')}")
 
-        auth_z_findings = [f for f in findings if f.get("finding_type") in ("authorization", "auth") and f.get("category") != "auth"]
-        auth_z_vuln = any(is_finding_vulnerable(f) for f in auth_z_findings)
+        az_tested = safe_get_list_len(authz_state, "tested_targets")
+        az_suspected = safe_get_list_len(authz_state, "successful_targets")
+        az_confirmed = safe_get_list_len(authz_state, "confirmed_vulnerabilities")
 
-        if auth_z_vuln:
-            st.markdown("**Result:** <span class='badge badge-confirmed'>FINDINGS DETECTED</span>", unsafe_allow_html=True)
+        az1, az2, az3 = st.columns(3)
+        with az1:
+            st.metric("Targets Tested", az_tested)
+        with az2:
+            st.metric("Suspected BOLA", az_suspected)
+        with az3:
+            st.metric("Confirmed Bypass", az_confirmed)
+
+        # Authorization findings live in the module state (they are
+        # canonicalized to the "auth" category in the global findings list,
+        # so filtering that list by category is unreliable).
+        az_findings = (
+            authz_state.get("findings")
+            or authz_state.get("successful_targets")
+            or []
+        )
+
+        if az_confirmed > 0:
+            st.markdown("**Result:** <span class='badge badge-high'>VULNERABLE</span>", unsafe_allow_html=True)
+            st.warning("Confirmed authorization bypass (broken object/function-level authorization) detected.")
+        elif az_suspected > 0 or az_findings:
+            st.markdown("**Result:** <span class='badge badge-medium'>FINDINGS DETECTED</span>", unsafe_allow_html=True)
+            st.warning("Suspected authorization weakness / excessive data exposure detected (requires manual confirmation).")
         else:
             st.markdown("**Result:** <span class='badge badge-pass'>PASS</span>", unsafe_allow_html=True)
-            st.success("No confirmed authorization bypasses were identified.")
+            st.success("No authorization findings were identified by this module.")
+
+        # Surface the affected endpoints + evidence.
+        if az_findings:
+            rows = []
+            for f in az_findings[:12]:
+                if not isinstance(f, dict):
+                    continue
+                data = f.get("data") if isinstance(f.get("data"), dict) else f
+                tgt = data.get("target") if isinstance(data.get("target"), dict) else {}
+                url = tgt.get("url") or f.get("endpoint") or data.get("url") or "—"
+                detail = f.get("detail") or data.get("detail") or ""
+                rows.append({"Endpoint": url, "Observation": (detail[:140] if detail else "—")})
+            if rows:
+                st.table(rows)
+
+        st.info(
+            "Note: confirmed broken object-level authorization (BOLA/IDOR) on "
+            "user baskets is reported under the IDOR module and the Adaptive AI "
+            "Chain below."
+        )
 
 st.divider()
 
@@ -964,7 +1353,7 @@ st.divider()
 st.markdown('<p class="sec-title">Adaptive AI Chain</p><p class="sec-subtitle">Dynamic module chaining based on discovered findings</p>', unsafe_allow_html=True)
 
 idor_ran = "idor_check" in modules
-has_chain = chains_triggered > 0 or len(chain_history) > 0
+has_chain = chains_triggered > 0 or chains_completed > 0
 
 if has_chain or idor_ran:
     # Determine chain details from chain_history or pending_chains
@@ -1284,65 +1673,59 @@ st.divider()
 
 
 # ============================================================
-# 10. TECHNICAL EVIDENCE
+# 10. FINDINGS & EVIDENCE
 # ============================================================
-st.markdown('<p class="sec-title">Technical Evidence</p><p class="sec-subtitle">Raw finding data for detailed analysis (sensitive fields redacted)</p>', unsafe_allow_html=True)
+st.markdown('<p class="sec-title">Findings &amp; Evidence</p><p class="sec-subtitle">Every finding with its supporting evidence, ranked by severity (sensitive values redacted)</p>', unsafe_allow_html=True)
 
-with st.expander("Finding Evidence"):
+evidence_items = build_evidence_findings(state)
+
+_sev_rank = {"sev-critical": 0, "sev-high": 1, "sev-medium": 2, "sev-low": 3, "sev-info": 4}
+_status_rank = {"CONFIRMED": 0, "SUSPECTED": 1, "POTENTIAL": 2, "INFO": 3, "PASS": 4}
+evidence_items.sort(
+    key=lambda it: (_sev_rank.get(it["sev"][1], 9), _status_rank.get(it["status"][0], 9))
+)
+
+# Severity / status summary pills
+pill_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "POTENTIAL": 0}
+for it in evidence_items:
+    if it["status"][0] == "POTENTIAL":
+        pill_counts["POTENTIAL"] += 1
+    else:
+        pill_counts[it["sev"][0]] = pill_counts.get(it["sev"][0], 0) + 1
+
+pill_html = ['<div class="sev-summary-row">']
+for lbl, cls in [
+    ("CRITICAL", "c-critical"), ("HIGH", "c-high"), ("MEDIUM", "c-medium"),
+    ("LOW", "c-low"), ("POTENTIAL", "c-potential"),
+]:
+    pill_html.append(
+        f'<div class="sev-pill {cls}"><div class="num">{pill_counts.get(lbl, 0)}</div>'
+        f'<div class="lbl">{lbl}</div></div>'
+    )
+pill_html.append('</div>')
+st.markdown("".join(pill_html), unsafe_allow_html=True)
+
+if evidence_items:
+    for it in evidence_items:
+        render_evidence_card(it)
+        if it.get("table"):
+            st.table(it["table"])
+else:
+    st.markdown(
+        '<div class="ev-empty">No confirmed vulnerabilities or potential findings were identified.</div>',
+        unsafe_allow_html=True,
+    )
+
+with st.expander("Raw finding data (redacted JSON)"):
     if findings:
-        for i, finding in enumerate(findings):
-            safe_finding = redact_sensitive(copy.deepcopy(finding))
-            finding_type = safe_finding.get("finding_type", "unknown").upper()
-            st.markdown(f"**{finding_type}** — Finding {i+1}")
-            st.json(safe_finding)
-            if i < len(findings) - 1:
-                st.markdown("---")
+        st.json(redact_sensitive(copy.deepcopy(findings)))
     else:
         st.caption("No findings recorded.")
-
-with st.expander("Recon State Evidence"):
-    safe_recon = redact_sensitive(copy.deepcopy(recon_state))
-    st.json(safe_recon)
-
-with st.expander("Security Header Evidence"):
-    headers = tech_stack.get("security_headers_present", {})
-    if headers:
-        st.json(headers)
-    else:
-        st.caption("No security header data available.")
-
-if idor_ran:
-    with st.expander("IDOR Ownership Evidence"):
-        idor_findings = [f for f in findings if f.get("finding_type") == "idor"]
-        if idor_findings:
-            for f in idor_findings:
-                data = f.get("data", {})
-                if not isinstance(data, dict):
-                    continue
-                auth_user = data.get("authenticated_user_id", "Unknown")
-                unauth_baskets = data.get("unauthorized_baskets", [])
-                if unauth_baskets:
-                    table_data = []
-                    for b in unauth_baskets:
-                        if isinstance(b, dict):
-                            table_data.append({
-                                "Resource": f"Basket {b.get('basket_id', 'N/A')}",
-                                "Resource Owner": f"User {b.get('owner_user_id', 'Unknown')}",
-                                "Authenticated User": auth_user,
-                                "Authorization Result": "❌ Unauthorized"
-                            })
-                    if table_data:
-                        st.table(table_data)
-                else:
-                    st.json(redact_sensitive(copy.deepcopy(f)))
-        else:
-            safe_idor = redact_sensitive(copy.deepcopy(idor_state))
-            st.json(safe_idor)
-
-if "xss_check" in modules:
-    with st.expander("XSS Evidence"):
-        safe_xss = redact_sensitive(copy.deepcopy(xss_state))
-        st.json(safe_xss)
+    st.markdown("**Reconnaissance state**")
+    st.json(redact_sensitive(copy.deepcopy(recon_state)))
+    if "xss_check" in modules:
+        st.markdown("**XSS state**")
+        st.json(redact_sensitive(copy.deepcopy(xss_state)))
 
 st.divider()
 

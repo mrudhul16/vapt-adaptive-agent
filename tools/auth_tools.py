@@ -152,9 +152,8 @@ def detect_authentication_indicators(response):
 
 
 def analyze_security_question(response):
-    body = sanitize_text(
-        response.text
-    ).lower()
+    raw = response.text or ""
+    body = sanitize_text(raw).lower()
 
     question_words = [
         "question",
@@ -178,12 +177,138 @@ def analyze_security_question(response):
         for word in answer_words
     )
 
+    # A populated security question returned for a supplied email means the
+    # endpoint discloses account-specific data (the question) unauthenticated.
+    # An empty object ({}) means no such account / nothing disclosed.
+    security_question_disclosed = (
+        response.status_code == 200
+        and '"question"' in body
+        and len(raw.strip()) > 10
+    )
+
     return {
         "status_code": response.status_code,
         "question_present": question_present,
         "answer_present": answer_present,
-        "email_present": "email" in body
+        "email_present": "email" in body,
+        "security_question_disclosed": security_question_disclosed,
+        "response_length": len(raw.strip()),
     }
+
+
+def _random_nonexistent_email():
+    import uuid
+    return f"nonexistent-{uuid.uuid4().hex[:10]}@example.invalid"
+
+
+def _email_from_url(url):
+    """Extract an ?email= value from a URL if present and non-empty."""
+    try:
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(url).query, keep_blank_values=True)
+        for key in ("email", "user", "username"):
+            vals = qs.get(key)
+            if vals and vals[0].strip():
+                return vals[0].strip()
+    except Exception:
+        pass
+    return None
+
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _harvest_emails(recon_state, limit=5):
+    """Collect up to `limit` distinct email addresses from recon data so the
+    enumeration probe has real candidates to differentiate against."""
+    if not isinstance(recon_state, dict):
+        return []
+    found = []
+    seen = set()
+    try:
+        import json as _json
+        blob = _json.dumps(recon_state, default=str)
+    except Exception:
+        blob = str(recon_state)
+    for match in _EMAIL_RE.findall(blob):
+        email = match.strip().lower()
+        if email.endswith(".invalid") or email in seen:
+            continue
+        seen.add(email)
+        found.append(email)
+        if len(found) >= limit:
+            break
+    return found
+
+
+def detect_security_question_enumeration(base_url, candidate_emails=None):
+    """
+    Detection-only user-enumeration check for the security-question endpoint.
+
+    Sends an unauthenticated request for a known-nonexistent email (control)
+    and, if any candidate emails are available, for each candidate. A
+    materially different, account-specific response for a candidate (the
+    security question is disclosed) while the control returns nothing
+    demonstrates user enumeration. No credentials are submitted.
+    """
+    endpoint = base_url.rstrip("/") + "/rest/user/security-question"
+    session = create_session()
+
+    result = {
+        "endpoint": endpoint,
+        "enumeration_detected": False,
+        "security_question_disclosed": False,
+        "candidates_tested": 0,
+        "disclosed_for": [],
+        "detail": (
+            "Security-question endpoint probed with a non-existent email; "
+            "no enumeration observed."
+        ),
+    }
+
+    try:
+        control = analyze_security_question(
+            session.get(
+                endpoint,
+                params={"email": _random_nonexistent_email()},
+                timeout=8,
+            )
+        )
+    except requests.RequestException as exc:
+        result["error"] = type(exc).__name__
+        return result
+
+    result["control_response_length"] = control["response_length"]
+
+    for email in (candidate_emails or []):
+        if not email:
+            continue
+        result["candidates_tested"] += 1
+        try:
+            probe = analyze_security_question(
+                session.get(endpoint, params={"email": email}, timeout=8)
+            )
+        except requests.RequestException:
+            continue
+
+        if (
+            probe["security_question_disclosed"]
+            and not control["security_question_disclosed"]
+        ):
+            result["enumeration_detected"] = True
+            result["security_question_disclosed"] = True
+            # Record only that this address resolved to an account (no PII dump).
+            result["disclosed_for"].append(email)
+
+    if result["enumeration_detected"]:
+        result["detail"] = (
+            "Unauthenticated security-question endpoint returns account-"
+            "specific data for a valid email but an empty response for a "
+            "non-existent one, enabling user enumeration and exposing the "
+            "account's security question."
+        )
+
+    return result
 
 
 def analyze_login_response(response):
@@ -518,18 +643,36 @@ def execute_auth_test(recon_state, target):
             "security-question" in lower_url
             or "security_question" in lower_url
         ):
-            analysis = analyze_security_question(
-                response
+            analysis = analyze_security_question(response)
+
+            parsed = urlparse(url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+            # Candidate emails: any carried by the target, plus emails already
+            # discovered elsewhere in recon (e.g. exposed user listings). The
+            # probe only flags enumeration when a candidate resolves to an
+            # account while a random non-existent email does not.
+            candidate_emails = []
+            carried = _email_from_url(url)
+            if carried:
+                candidate_emails.append(carried)
+            candidate_emails.extend(_harvest_emails(recon_state))
+
+            enumeration = detect_security_question_enumeration(
+                base_url,
+                candidate_emails=candidate_emails,
             )
 
             result = {
-                "vulnerable": False,
+                "vulnerable": enumeration.get("enumeration_detected", False),
+                "suspected": enumeration.get("security_question_disclosed", False),
                 "authenticated": False,
                 **analysis,
-                "detail": (
-                    "Security-question endpoint "
-                    "analyzed without submitting an answer."
-                )
+                "enumeration": enumeration,
+                "detail": enumeration.get(
+                    "detail",
+                    "Security-question endpoint analyzed without submitting an answer.",
+                ),
             }
 
         elif (

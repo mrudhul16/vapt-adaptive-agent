@@ -96,67 +96,50 @@ def choose_next_target(state):
 
     BATCH_SIZE = 5
 
-    prompt = f"""
-Target:
-{state["target_url"]}
-
-Authenticated session available:
-{session_available}
-
-Discovered IDOR targets:
-{json.dumps(
-    discovered_targets,
-    indent=2
-)}
-
-Already tested:
-{json.dumps(
-    tested_targets,
-    indent=2
-)}
-
-Remaining targets:
-{json.dumps(
-    remaining_targets,
-    indent=2
-)}
-
-Previous observations:
-{json.dumps(
-    observations,
-    indent=2
-)}
-
-Choose up to {BATCH_SIZE} of the next IDOR targets.
-
-Only select targets from the remaining targets.
-
-Do not invent a target.
-
-The authenticated session is available to the testing
-tool internally. Do not ask for or output the token.
-
-Return only JSON.
-"""
-
-    response = llm.invoke(
-        [
-            (
-                "system",
-                SYSTEM_PROMPT
+    # Compact: present only the untested targets, by their discovered index,
+    # without duplicate lists, full observations, or indentation whitespace.
+    remaining_compact = [
+        {
+            "i": rt["index"],
+            "url": (
+                rt["target"].get("url")
+                if isinstance(rt["target"], dict) else str(rt["target"])
             ),
-            (
-                "human",
-                prompt
-            )
-        ]
-    )
+            "m": (
+                rt["target"].get("method", "GET")
+                if isinstance(rt["target"], dict) else "GET"
+            ),
+        }
+        for rt in remaining_targets
+    ]
+
+    prompt = f"""IDOR specialist. Target: {state["target_url"]}
+Authenticated session available: {session_available}
+Pick up to {BATCH_SIZE} targets to test, by their "i" index, from this remaining list:
+{json.dumps(remaining_compact, separators=(",", ":"))}
+Only choose indices listed above. Do not invent targets. The session is used by the
+tool internally; never ask for or output the token.
+Return ONLY JSON: {{"action":"test","target_indices":[..],"reason":"short"}} or {{"action":"finish","target_indices":[],"reason":"short"}}"""
 
     try:
+        response = llm.invoke(
+            [
+                (
+                    "system",
+                    SYSTEM_PROMPT
+                ),
+                (
+                    "human",
+                    prompt
+                )
+            ]
+        )
         decision = parse_decision(
             response.content
         )
-    except Exception:
+    except Exception as e:
+        print(f"[IDOR] GPT decision failed: {e}")
+        decision = None
         decision = None
 
     if decision is None:

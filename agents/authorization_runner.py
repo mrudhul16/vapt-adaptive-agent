@@ -336,8 +336,23 @@ def run_authorization_specialist(
         )
     )
 
+    authz_findings = authz_state.get("findings", [])
+
     return {
         "specialist": True,
+
+        "vulnerable": len(authz_findings) > 0,
+
+        "data": {
+            "vulnerable": len(authz_findings) > 0,
+            "findings": authz_findings,
+            "successful_targets": authz_findings,
+            "detail": (
+                f"Authorization analysis completed across "
+                f"{len(authz_state.get('tested_targets', []))} endpoints; "
+                f"{len(authz_findings)} finding(s)."
+            ),
+        },
 
         "targets_discovered": len(
             authz_state.get(

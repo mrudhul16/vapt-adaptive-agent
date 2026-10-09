@@ -281,6 +281,7 @@ def analyze_authorization_response(
     authenticated_request: bool = False,
     baseline_status_code=None,
     baseline_authentication_required: bool = False,
+    authenticated_user_id=None,
 ) -> dict:
 
     url = target.get(
@@ -321,28 +322,16 @@ def analyze_authorization_response(
     suspicious_behavior = False
     vulnerable = False
     authorization_bypass = False
+    suspected = False
+    confirmed = False
+    inconclusive = False
+    multiple_user_records_exposed = False
 
     detail = "Authorization behavior analyzed."
 
     if authenticated_request:
 
-        if (
-            baseline_authentication_required
-            and status_code in {
-                200,
-                201,
-                202,
-                204,
-                206,
-            }
-        ):
-            detail = (
-                "Authenticated request reached the protected endpoint. "
-                "Successful authenticated access alone does not establish "
-                "an authorization vulnerability."
-            )
-
-        elif status_code in {401, 403}:
+        if status_code in {401, 403}:
             detail = (
                 "Authenticated request was still denied by the endpoint."
             )
@@ -373,19 +362,105 @@ def analyze_authorization_response(
                 204,
                 206,
             } and is_json:
+                try:
+                    import json
+                    resp_data = json.loads(body)
+                    
+                    items = (
+                        resp_data.get("data", resp_data)
+                        if isinstance(resp_data, dict)
+                        else resp_data
+                    )
+                    
+                    mismatched_owner_ids = set()
+                    extracted_owner_ids = set()
+                    
+                    if isinstance(items, dict):
+                        for key in ("UserId", "userId", "user_id"):
+                            if key in items:
+                                extracted_owner_ids.add(str(items[key]))
+                                if authenticated_user_id is not None and str(items[key]) != str(authenticated_user_id):
+                                    mismatched_owner_ids.add(str(items[key]))
+                                break
+                    elif isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict):
+                                for key in ("UserId", "userId", "user_id"):
+                                    if key in item:
+                                        extracted_owner_ids.add(str(item[key]))
+                                        if authenticated_user_id is not None and str(item[key]) != str(authenticated_user_id):
+                                            mismatched_owner_ids.add(str(item[key]))
+                                        break
+                    
+                    mismatched_owners_str = ", ".join(sorted(list(mismatched_owner_ids)))
+                    extracted_owners_str = ", ".join(sorted(list(extracted_owner_ids)))
+                    
+                    is_user_list = (
+                        isinstance(items, list)
+                        and len(items) > 1
+                        and any(
+                            isinstance(item, dict) and "email" in item
+                            for item in items
+                        )
+                    )
 
+                    if extracted_owner_ids and authenticated_user_id is None:
+                        inconclusive = True
+                        detail = (
+                            f"Resource returned owner IDs ({extracted_owners_str}) but "
+                            "authenticated_user_id is missing. Inconclusive ownership check."
+                        )
+                    elif mismatched_owner_ids:
+                            suspicious_behavior = True
+                            vulnerable = True
+                            authorization_bypass = False
+                            suspected = True
+                            confirmed = False
+                            unauthorized_access = False
+                            multiple_user_records_exposed = False
+                            detail = (
+                                f"Authenticated request successfully accessed resource(s) "
+                                f"belonging to other users (owner IDs: {mismatched_owners_str}, "
+                                f"authenticated ID: {authenticated_user_id}). This is a strong signal "
+                                f"of IDOR/BOLA, but requires policy verification to confirm."
+                            )
+                    elif is_user_list:
+                        suspicious_behavior = True
+                        vulnerable = True
+                        authorization_bypass = False
+                        suspected = True
+                        confirmed = False
+                        unauthorized_access = False
+                        multiple_user_records_exposed = True
+                        detail = (
+                            "Authenticated request successfully reached a backend "
+                            "resource and returned multiple user records. "
+                            "This indicates potential excessive data exposure, "
+                            "but requires verification of the expected authorization policy."
+                        )
+                    else:
+                        detail = (
+                            "Authenticated request successfully reached a backend "
+                            "resource. No privilege-boundary bypass was established "
+                            "without evidence of an unauthorized role or owner."
+                        )
+                except Exception:
+                    detail = (
+                        "Authenticated request successfully reached a backend "
+                        "resource. No privilege-boundary bypass was established "
+                        "without evidence of an unauthorized role or owner."
+                    )
+            elif status_code in {200, 201, 202, 204, 206} and baseline_authentication_required:
                 detail = (
-                    "Authenticated request successfully reached a backend "
-                    "resource. No privilege-boundary bypass was established "
-                    "without evidence of an unauthorized role or owner."
+                    "Authenticated request reached the protected endpoint. "
+                    "Successful authenticated access alone does not establish "
+                    "an authorization vulnerability."
                 )
-
             elif 200 <= status_code < 300:
                 detail = (
                     "Authenticated request succeeded, but the response did "
                     "not provide sufficient evidence of an authorization bypass."
                 )
-
             else:
                 detail = (
                     "Authenticated backend request completed without evidence "
@@ -429,15 +504,31 @@ def analyze_authorization_response(
 
             if is_json:
 
-                unauthorized_access = True
-                suspicious_behavior = True
-                vulnerable = True
-                authorization_bypass = True
+                if baseline_authentication_required:
+                    unauthorized_access = True
+                    suspicious_behavior = True
+                    vulnerable = True
+                    authorization_bypass = True
+                    suspected = True
+                    confirmed = False
 
-                detail = (
-                    "Backend resource returned successfully "
-                    "without authentication."
-                )
+                    detail = (
+                        "Backend resource that typically requires authentication "
+                        "returned JSON successfully without authentication. "
+                        "Requires verification to confirm unauthorized data exposure."
+                    )
+                else:
+                    unauthorized_access = False
+                    suspicious_behavior = False
+                    vulnerable = False
+                    authorization_bypass = False
+                    suspected = False
+                    confirmed = False
+
+                    detail = (
+                        "Backend resource returned JSON successfully without authentication. "
+                        "This may be a public API."
+                    )
 
             else:
 
@@ -452,15 +543,30 @@ def analyze_authorization_response(
             206,
         }:
 
-            unauthorized_access = True
-            suspicious_behavior = True
-            vulnerable = True
-            authorization_bypass = True
+            if baseline_authentication_required:
+                unauthorized_access = True
+                suspicious_behavior = True
+                vulnerable = True
+                authorization_bypass = True
+                suspected = True
+                confirmed = False
 
-            detail = (
-                "Backend resource returned successfully "
-                "without an authentication boundary."
-            )
+                detail = (
+                    "Backend resource that typically requires authentication "
+                    "returned successfully (204/206) without an authentication boundary."
+                )
+            else:
+                unauthorized_access = False
+                suspicious_behavior = False
+                vulnerable = False
+                authorization_bypass = False
+                suspected = False
+                confirmed = False
+                
+                detail = (
+                    "Backend resource returned successfully (204/206) "
+                    "without authentication. This may be public."
+                )
 
         elif 200 <= status_code < 300:
 
@@ -485,6 +591,10 @@ def analyze_authorization_response(
 
     return {
         "vulnerable": vulnerable,
+        "suspected": suspected,
+        "confirmed": confirmed,
+        "inconclusive": inconclusive,
+        "multiple_user_records_exposed": multiple_user_records_exposed,
         "unauthorized_access": unauthorized_access,
         "authorization_bypass": authorization_bypass,
         "authenticated_request": authenticated_request,
@@ -766,6 +876,9 @@ def execute_authorization_test(
                 )
             )
 
+            from tools.idor_tools import _get_authenticated_user_id
+            current_user_id = _get_authenticated_user_id(auth_session)
+
             authenticated_analysis = (
                 analyze_authorization_response(
                     target,
@@ -780,6 +893,7 @@ def execute_authorization_test(
                             False,
                         )
                     ),
+                    authenticated_user_id=current_user_id,
                 )
             )
 

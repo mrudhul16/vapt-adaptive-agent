@@ -94,7 +94,10 @@ def run_auth_specialist(recon_state):
             for target in authentication_targets
             if isinstance(target, dict)
             and target.get("url")
-        ]
+        ],
+        # Emails discovered elsewhere (seeded by the orchestrator) let the
+        # user-enumeration probe differentiate real accounts from fake ones.
+        "discovered_emails": auth_source.get("discovered_emails", []),
     }
 
     # ---------------------------------------------------------
@@ -184,8 +187,8 @@ def run_auth_specialist(recon_state):
             result_status
         )
 
-        if result.get("success") is True:
-
+        result_data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(result_data, dict) and result_data.get("vulnerable") is True:
             successful_targets += 1
 
         update_auth_state(
@@ -241,14 +244,17 @@ def run_auth_specialist(recon_state):
     )
 
     print(
-        "Authenticated:",
-        auth_state[
-            "authenticated"
-        ]
+        "Session Created by Module:",
+        auth_state.get("session_created_by_module", False)
     )
+
+    auth_findings = auth_state.get("findings", [])
 
     return {
         "module": "authentication",
+
+        # Surface auth weaknesses to the orchestrator/dashboard.
+        "vulnerable": len(auth_findings) > 0,
 
         "state": auth_state,
 
@@ -270,14 +276,22 @@ def run_auth_specialist(recon_state):
             ]
         ),
 
-        "authenticated": auth_state[
-            "authenticated"
-        ],
-
-        "findings": auth_state.get(
-            "findings",
-            []
+        "authenticated": auth_state.get(
+            "session_created_by_module", False
         ),
+
+        "findings": auth_findings,
+
+        "data": {
+            "vulnerable": len(auth_findings) > 0,
+            "findings": auth_findings,
+            "successful_targets": auth_findings,
+            "detail": (
+                f"Authentication analysis completed across "
+                f"{len(auth_state.get('tested_targets', []))} endpoints; "
+                f"{len(auth_findings)} weakness(es) flagged."
+            ),
+        },
 
         "observations": auth_state.get(
             "observations",

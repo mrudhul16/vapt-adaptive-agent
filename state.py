@@ -13,9 +13,12 @@ class AgentState(TypedDict):
 
     modules_run: List[str]
 
+    attack_graph: Dict[str, Any]
+
     pending_chains: List[dict]
     pending_chain: Optional[dict]
     chain_history: List[dict]
+    selected_chain: List[str]
 
     _next_action: str
 
@@ -55,9 +58,16 @@ def initial_state(
 
         "modules_run": [],
 
+        "attack_graph": {
+            "nodes": {},
+            "edges": [],
+            "hypotheses": []
+        },
+
         "pending_chains": [],
         "pending_chain": None,
         "chain_history": [],
+        "selected_chain": [],
 
         "_next_action": "",
 
@@ -117,6 +127,7 @@ def initial_state(
             "discovered_targets": [],
             "tested_targets": [],
             "successful_targets": [],
+            "confirmed_vulnerabilities": [],
             "remaining_targets": [],
             "observations": [],
             "current_target": None,
@@ -128,6 +139,7 @@ def initial_state(
             "discovered_targets": [],
             "tested_targets": [],
             "successful_targets": [],
+            "confirmed_vulnerabilities": [],
             "remaining_targets": [],
             "observations": [],
             "current_target": None,

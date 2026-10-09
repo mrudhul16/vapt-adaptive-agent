@@ -405,20 +405,36 @@ def update_auth_state(
 
     if isinstance(result, dict):
 
-        if result.get("authenticated") is True:
-            auth_state["authenticated"] = True
+        # execute_auth_test nests its analysis under result["data"]; earlier
+        # code read the top level, so authentication and vulnerable flags were
+        # never seen. Read the data level (falling back to the top level).
+        data = result.get("data")
+        if not isinstance(data, dict):
+            data = result
 
-        if result.get("session_created") is True:
-            auth_state["authenticated"] = True
+        if data.get("session_created") is True:
+            auth_state["session_created_by_module"] = True
 
-        if result.get("finding"):
-            auth_state.setdefault(
-                "findings",
-                []
-            ).append(
-                sanitize_auth_result(
-                    result["finding"]
-                )
+        # Record an evidence-backed finding when the endpoint analysis flagged
+        # a weakness (e.g. user enumeration, unauthenticated identity exposure).
+        if data.get("vulnerable") is True:
+            finding = {
+                "finding_type": "auth",
+                "category": "auth",
+                "vulnerable": True,
+                "endpoint": target_url,
+                "detail": data.get(
+                    "detail",
+                    "Authentication-related weakness detected."
+                ),
+                "evidence": {
+                    k: v
+                    for k, v in data.items()
+                    if k not in {"response_preview", "response_headers"}
+                },
+            }
+            auth_state.setdefault("findings", []).append(
+                sanitize_auth_result(finding)
             )
 
     tested_set = set(
@@ -531,7 +547,7 @@ def initialize_auth_state(recon_state):
         "remaining_targets": discovered.copy(),
         "observations": [],
         "findings": [],
-        "authenticated": False,
+        "session_created_by_module": False,
         "iteration": 0,
         "completed": False
     }

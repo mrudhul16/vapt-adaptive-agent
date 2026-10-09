@@ -626,6 +626,14 @@ def normalize_js_route(
             "http://" + value
         )
 
+    elif value.startswith("//"):
+        # Protocol-relative URL
+        absolute_url = "https:" + value
+
+    elif re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/|$)", value) and "localhost" not in value:
+        # Looks like a domain (e.g., api.ipify.org or accounts.google.com)
+        absolute_url = "https://" + value
+
     elif value.startswith("/"):
         absolute_url = urljoin(
             base_url,

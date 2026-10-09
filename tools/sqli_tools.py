@@ -410,17 +410,102 @@ def _submit_login(page, submit):
             return False
 
 
+def _login_authenticates(page, context, target, email_value, password_value):
+    """
+    Attempt a single login and report whether it resulted in an authenticated
+    session, using the same success criteria as the injection test
+    (left the login route AND a token or a visible Logout control appeared).
+
+    Used both for the injection payload and for the benign control/baseline.
+    """
+    page.goto(
+        target["url"],
+        wait_until="domcontentloaded",
+        timeout=15000
+    )
+    page.wait_for_timeout(500)
+
+    baseline_url = page.url
+
+    email = page.locator(target["email_selector"])
+    password = page.locator(target["password_selector"])
+    submit = page.locator(target["submit_selector"])
+
+    if email.count() == 0 or password.count() == 0 or submit.count() == 0:
+        return None  # form not usable
+
+    email.fill(email_value)
+    password.fill(password_value)
+
+    if not _submit_login(page, submit):
+        return None
+
+    page.wait_for_timeout(1500)
+
+    current_url = page.url
+    url_changed = current_url != baseline_url
+    login_transition = "#/login" not in current_url.lower()
+
+    token, _ = _get_auth_token(context)
+
+    try:
+        logout = page.locator("text=Logout")
+        logout_visible = logout.count() > 0 and logout.first.is_visible()
+    except Exception:
+        logout_visible = False
+
+    return {
+        "authenticated": url_changed and login_transition and (bool(token) or logout_visible),
+        "url_changed": url_changed,
+        "login_transition": login_transition,
+        "token_found": bool(token),
+        "logout_visible": logout_visible,
+    }
+
+
+def _baseline_login_authenticates(browser, target):
+    """
+    Control test: does a benign (non-injection) wrong-password login succeed?
+
+    If it does, the application does not actually require valid credentials, so
+    a later "bypass" cannot be attributed to SQL injection. Runs in its own
+    throwaway context so it never pollutes the injection session.
+    """
+    context = browser.new_context()
+    try:
+        page = context.new_page()
+        outcome = _login_authenticates(
+            page,
+            context,
+            target,
+            "sqli-control-not-a-user@example.invalid",
+            TEST_PASSWORD,
+        )
+        return bool(outcome and outcome.get("authenticated"))
+    except Exception:
+        # If the control cannot be established, be conservative: treat as
+        # "baseline authenticates" so we do NOT claim an injection-caused
+        # bypass without a clean negative control.
+        return True
+    finally:
+        context.close()
+
+
 def _test_login_sqli(
     page,
     context,
     target,
-    payload
+    payload,
+    baseline_authenticates=False
 ):
 
     result = {
         "payload": payload,
         "vulnerable": False,
+        "confirmed": False,
+        "suspected": False,
         "authenticated": False,
+        "authentication_bypass_verified": False,
         "token_found": False,
         "token_source": None,
         "url_changed": False,
@@ -519,13 +604,48 @@ def _test_login_sqli(
 
             result["logout_visible"] = False
 
-        result["authenticated"] = (
-            bool(token)
-            or result["logout_visible"]
+        verified_login = (
+            result["url_changed"]
+            and result["login_transition"]
+            and (result["token_found"] or result["logout_visible"])
         )
 
-        if result["authenticated"]:
-            result["vulnerable"] = True
+        body_text = ""
+        try:
+            body_text = page.locator("body").inner_text().lower()
+        except Exception:
+            pass
+            
+        sql_errors = [
+            "sql syntax",
+            "syntax error",
+            "sqlite",
+            "mysql",
+            "postgresql",
+            "postgres",
+            "sequelize",
+            "database error",
+            "sqlstate",
+            "unterminated string",
+            "you have an error in your sql"
+        ]
+        
+        has_sql_error = any(indicator in body_text for indicator in sql_errors)
+
+        result["authenticated"] = verified_login
+
+        # The bypass is attributable to SQL injection ONLY when the injection
+        # payload authenticates while a benign wrong-password control did not.
+        # A login that also succeeds for benign credentials (or any ordinary
+        # successful login) does NOT count as a verified SQLi bypass.
+        injection_caused_bypass = verified_login and not baseline_authenticates
+        result["authentication_bypass_verified"] = injection_caused_bypass
+
+        # Suspected: injection-caused bypass without an explicit SQL error.
+        result["suspected"] = injection_caused_bypass and not has_sql_error
+
+        result["vulnerable"] = injection_caused_bypass or has_sql_error
+        result["confirmed"] = has_sql_error
 
         return result
 
@@ -546,6 +666,7 @@ def _test_generic_sqli(
     result = {
         "payload": payload,
         "vulnerable": False,
+        "confirmed": False,
         "authenticated": False,
         "token_found": False,
         "token_source": None,
@@ -640,13 +761,8 @@ def _test_generic_sqli(
             for indicator in sql_errors
         )
 
-        token, token_source = (
-            _get_auth_token(context)
-        )
-
-        result["token_found"] = bool(token)
-        result["token_source"] = token_source
-        result["authenticated"] = bool(token)
+        result["confirmed"] = False
+        result["authenticated"] = False
 
         return result
 
@@ -688,7 +804,9 @@ def execute_sqli_test(
     observations = []
 
     vulnerable = False
+    confirmed = False
     authenticated = False
+    bypass_verified = False
 
     chain_trigger = False
     chain_data = None
@@ -703,6 +821,15 @@ def execute_sqli_test(
 
         page = context.new_page()
 
+        # Establish a benign negative control once per login form: a
+        # wrong-password login with a non-injection email must fail, otherwise
+        # we cannot attribute any later bypass to SQL injection.
+        baseline_authenticates = False
+        if target.get("type") == "login_form":
+            baseline_authenticates = _baseline_login_authenticates(
+                browser, target
+            )
+
         try:
 
             for payload in SQLI_PAYLOADS:
@@ -715,7 +842,8 @@ def execute_sqli_test(
                         page,
                         context,
                         target,
-                        payload
+                        payload,
+                        baseline_authenticates=baseline_authenticates
                     )
 
                 else:
@@ -731,48 +859,41 @@ def execute_sqli_test(
                     result
                 )
 
-                if result.get(
-                    "vulnerable"
-                ):
-
+                if result.get("vulnerable"):
                     vulnerable = True
 
-                if result.get(
-                    "authenticated"
-                ):
+                if result.get("confirmed"):
+                    confirmed = True
 
-                    authenticated = True
-                    chain_trigger = True
+                if result.get("authentication_bypass_verified") is True:
+                    bypass_verified = True
 
-                    token, token_source = (
-                        _get_auth_token(
-                            context
-                        )
-                    )
+                if (
+                    result.get("confirmed") is True
+                    or result.get("authentication_bypass_verified") is True
+                ) and result.get("authenticated") is True:
+                    token, token_source = _get_auth_token(context)
+                    if token:
+                        authenticated = True
+                        chain_trigger = True
 
-                    chain_data = {
-                        "chain": "sqli_to_idor",
-                        "reason": (
-                            "SQL injection produced "
-                            "an authenticated session."
-                        ),
-                        "authenticated": True,
-                        "auth_token_found": bool(
-                            token
-                        ),
-                        "auth_token_source": (
-                            token_source
-                        ),
+                        chain_data = {
+                            "chain": "sqli_to_idor",
+                            "reason": (
+                                "SQL injection produced "
+                                "an authenticated session."
+                            ),
+                            "authenticated": True,
+                            "auth_token_found": True,
+                            "auth_token_source": token_source,
+                            "authenticated_session": {
+                                "token": token
+                            },
+                            "target": target,
+                            "observations": observations
+                        }
 
-                        "authenticated_session": {
-                            "token": token
-                        },
-
-                        "target": target,
-                        "observations": observations
-                    }
-
-                    break
+                        break
 
             token, token_source = (
                 _get_auth_token(context)
@@ -808,7 +929,9 @@ def execute_sqli_test(
                 "success": True,
                 "data": {
                     "vulnerable": vulnerable,
+                    "confirmed": confirmed,
                     "authenticated": authenticated,
+                    "authentication_bypass_verified": bypass_verified,
                     "target": target,
                     "observations": observations,
                     "cookie_names": cookie_names,

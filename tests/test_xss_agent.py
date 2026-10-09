@@ -14,7 +14,7 @@ from state import initial_state
 
 from agents.xss_agent import (
     choose_next_target,
-    test_selected_target
+    test_selected_target as run_target
 )
 
 from tools.xss_tools import get_xss_targets
@@ -67,11 +67,13 @@ while True:
         "target_index"
     ]
 
+    # choose_next_target now returns an index into the expanded candidate pool,
+    # not the raw reconnaissance set.
     target = state["xss_state"][
-        "discovered_targets"
+        "candidate_pool"
     ][target_index]
 
-    test_selected_target(
+    run_target(
         state,
         target,
         decision["reason"]
@@ -84,23 +86,27 @@ print("=" * 40)
 
 print(
     "Tested:",
-    state["xss_state"][
-        "tested_targets"
-    ]
+    len(state["xss_state"]["tested_targets"])
 )
 
 print(
-    "Successful:",
-    state["xss_state"][
-        "successful_targets"
-    ]
+    "Successful (Suspected):",
+    len(state["xss_state"]["successful_targets"])
+)
+
+print(
+    "Confirmed:",
+    len(state["xss_state"].get("confirmed_vulnerabilities", []))
+)
+
+print(
+    "Inconclusive:",
+    len(state["xss_state"].get("inconclusive_targets", []))
 )
 
 print(
     "Remaining:",
-    state["xss_state"][
-        "remaining_targets"
-    ]
+    len(state["xss_state"]["remaining_targets"])
 )
 
 print(

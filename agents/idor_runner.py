@@ -210,7 +210,7 @@ def run_idor_specialist(state):
         print()
 
         print(
-            "IDOR CONFIRMED:",
+            "IDOR SUSPECTED:",
             unauthorized_count,
             "unauthorized resource(s) accessible."
         )
@@ -220,17 +220,18 @@ def run_idor_specialist(state):
         print()
 
         print(
-            "NO IDOR CONFIRMED"
+            "NO IDOR SUSPECTED"
         )
 
     if vulnerable:
 
         detail = (
-            f"IDOR confirmed: "
+            f"IDOR suspected: "
             f"{unauthorized_count} "
             f"unauthorized resource(s) "
             f"were accessible to the "
-            f"authenticated user."
+            f"authenticated user. "
+            f"Requires verification."
         )
 
         impact = (
@@ -247,7 +248,7 @@ def run_idor_specialist(state):
             f"{len(tested_targets)} "
             f"targets. "
             f"No unauthorized resource "
-            f"access was confirmed."
+            f"access was suspected."
         )
 
         impact = (

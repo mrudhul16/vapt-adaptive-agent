@@ -350,17 +350,21 @@ If no useful targets remain:
 }}
 """
 
-    response = llm.invoke(prompt)
+    try:
+        response = llm.invoke(prompt)
 
-    response_text = getattr(
-        response,
-        "content",
-        str(response)
-    )
+        response_text = getattr(
+            response,
+            "content",
+            str(response)
+        )
 
-    decision = parse_decision(
-        response_text
-    )
+        decision = parse_decision(
+            response_text
+        )
+    except Exception as e:
+        print(f"[AUTHZ] LLM decision failed: {e}")
+        decision = None
 
     if decision is None:
         selected_targets = llm_candidates[:BATCH_SIZE]
@@ -461,6 +465,18 @@ def update_authorization_state(
         data = result.get("data", result)
 
         if isinstance(data, dict):
+            if data.get("suspected") is True:
+                authz_state.setdefault(
+                    "successful_targets",
+                    []
+                ).append(target)
+
+            if data.get("confirmed") is True:
+                authz_state.setdefault(
+                    "confirmed_vulnerabilities",
+                    []
+                ).append(target)
+
             if data.get("vulnerable") is True:
                 authz_state.setdefault(
                     "findings",
@@ -591,6 +607,8 @@ def initialize_authorization_state(recon_state):
         "discovered_targets": unique,
         "tested_targets": [],
         "remaining_targets": unique.copy(),
+        "successful_targets": [],
+        "confirmed_vulnerabilities": [],
         "observations": [],
         "findings": [],
         "iteration": 0,

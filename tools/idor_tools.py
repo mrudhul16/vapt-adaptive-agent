@@ -85,6 +85,18 @@ def _get_authenticated_user_id(
     authenticated_session
 ):
 
+    if not authenticated_session:
+        return None
+
+    # Preferred: Use explicitly stored user ID from a trusted authentication flow
+    explicit_user_id = authenticated_session.get("user_id")
+    if explicit_user_id is not None:
+        return explicit_user_id
+
+    # Fallback: Extract from the token payload.
+    # WARNING: Decoding a JWT locally does not verify its cryptographic signature.
+    # This is only safe here because the token is obtained directly from a trusted
+    # session established by our authentication flow, not from an unverified source.
     token = _get_token(
         authenticated_session
     )
@@ -289,10 +301,10 @@ def execute_idor_test(
     )
 
     result = {
-
         "target": target,
 
         "vulnerable": False,
+        "suspected": False,
 
         "status_code": None,
 
@@ -413,11 +425,15 @@ def execute_idor_test(
                 ] = ownership_mismatch
 
                 if ownership_mismatch:
-
                     result[
                         "unauthorized_access"
                     ] = True
 
+                    result[
+                        "suspected"
+                    ] = True
+                    
+                    # Do not independently confirm without secondary verification
                     result[
                         "vulnerable"
                     ] = True

@@ -1,3 +1,7 @@
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+
 import json
 import re
 
@@ -5,6 +9,7 @@ from dotenv import load_dotenv
 from groq_key_manager import get_llm
 
 from state import initial_state
+from modules.attack_graph import AttackGraph
 
 from agents.recon_runner import run_recon_specialist
 from agents.auth_runner import run_auth_specialist
@@ -15,6 +20,9 @@ from agents.authorization_runner import run_authorization_specialist
 from agents.xss_agent import (
     choose_next_target,
     test_selected_target,
+    _build_candidate_pool,
+    _target_identity,
+    classify_unexpandable_targets,
 )
 
 from modules.risk_engine import analyze_all
@@ -133,6 +141,28 @@ def sanitize_session_from_result(result):
     return cleaned
 
 
+def _redact_chain_data(chain_data):
+    """Return a copy of chain_data with the authenticated session/token removed."""
+    redacted = dict(chain_data)
+    for key in (
+        "authenticated_session",
+        "auth_session",
+        "session",
+        "token",
+        "auth_token",
+        "access_token",
+        "jwt",
+        "authorization",
+        "cookie",
+        "observations",
+    ):
+        redacted.pop(key, None)
+    # Preserve non-sensitive provenance flags.
+    if "auth_token_found" in chain_data:
+        redacted["auth_token_found"] = bool(chain_data.get("auth_token_found"))
+    return redacted
+
+
 def extract_recon_result(state):
     recon_state = state.get(
         "recon_state",
@@ -180,6 +210,73 @@ def extract_recon_result(state):
     return {}
 
 
+import re as _re
+
+_EMAIL_RE = _re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _collect_discovered_emails(state, limit=8):
+    """Harvest distinct email addresses already surfaced in findings so the
+    auth specialist can prove user enumeration. Local/authorized testing only."""
+    if not isinstance(state, dict):
+        return []
+    try:
+        import json as _json
+        blob = _json.dumps(state.get("findings", []), default=str)
+    except Exception:
+        blob = str(state.get("findings", []))
+
+    emails = []
+    seen = set()
+    for match in _EMAIL_RE.findall(blob):
+        email = match.strip().lower()
+        if email.endswith(".invalid") or email in seen:
+            continue
+        seen.add(email)
+        emails.append(email)
+        if len(emails) >= limit:
+            break
+    return emails
+
+
+def update_attack_graph_from_recon(state, recon_result):
+    graph = state.get("attack_graph")
+    if not graph or not isinstance(recon_result, dict):
+        return
+    data = recon_result.get("data", {})
+    if not isinstance(data, dict):
+        return
+    attack_surface = data.get("attack_surface", {})
+    if not isinstance(attack_surface, dict):
+        return
+    for category, targets in attack_surface.items():
+        if not isinstance(targets, list):
+            continue
+        for index, target in enumerate(targets):
+            if isinstance(target, dict):
+                target_data = target
+                url = (
+                    target.get("url")
+                    or target.get("target")
+                    or target.get("endpoint")
+                )
+            elif isinstance(target, str):
+                target_data = {"url": target}
+                url = target
+            else:
+                continue
+
+            if not url:
+                continue
+
+            node_id = f"{category}:{index}"
+            graph.add_node(
+                node_id=node_id,
+                node_type=category,
+                data=target_data
+            )
+
+
 def initialize_xss_state(
     state,
     recon_result
@@ -192,6 +289,10 @@ def initialize_xss_state(
         "discovered_targets"
     ):
         return state
+
+    from tools.xss_tools import get_xss_targets, is_local_target
+
+    base_url = state["target_url"].rstrip("/")
 
     recon_data = {}
 
@@ -221,7 +322,20 @@ def initialize_xss_state(
     ):
         attack_surface = {}
 
-    discovered_targets = []
+    raw_candidates = []
+
+    def add_target(target):
+        if not isinstance(target, dict):
+            return
+        item = dict(target)
+        raw_url = str(
+            item.get("url") or item.get("target") or item.get("endpoint") or ""
+        ).strip()
+        if not raw_url:
+            return
+        if not is_local_target(raw_url, base_url):
+            return
+        raw_candidates.append(item)
 
     categories = [
         "injection",
@@ -234,104 +348,93 @@ def initialize_xss_state(
     ]
 
     for category in categories:
-
         targets = attack_surface.get(
             category,
             []
         )
-
-        if not isinstance(
-            targets,
-            list
-        ):
+        if not isinstance(targets, list):
             continue
 
         for target in targets:
-
-            if isinstance(
-                target,
-                dict
-            ):
-                if (
-                    target.get("url")
-                    or target.get("target")
-                    or target.get("endpoint")
-                ):
-                    discovered_targets.append(
-                        dict(target)
-                    )
-
-            elif isinstance(
-                target,
-                str
-            ):
-                discovered_targets.append(
-                    {
-                        "url": target
-                    }
-                )
+            if isinstance(target, dict):
+                add_target(target)
+            elif isinstance(target, str):
+                add_target({"url": target})
 
     endpoints = recon_data.get(
         "endpoints",
         []
     )
 
-    if isinstance(
-        endpoints,
-        list
-    ):
+    if isinstance(endpoints, list):
         for endpoint in endpoints:
+            if isinstance(endpoint, dict):
+                add_target(endpoint)
+            elif isinstance(endpoint, str):
+                add_target({"url": endpoint})
 
-            if isinstance(
-                endpoint,
-                dict
-            ):
-                if (
-                    endpoint.get("url")
-                    or endpoint.get("endpoint")
-                ):
-                    discovered_targets.append(
-                        dict(endpoint)
-                    )
+    # Seed 1: Browser-discovered form inputs
+    try:
+        browser_targets = get_xss_targets(state)
+        if isinstance(browser_targets, list):
+            for bt in browser_targets:
+                if isinstance(bt, dict):
+                    add_target(bt)
+    except Exception as e:
+        print(f"[XSS] Browser target discovery warning: {e}")
 
-            elif isinstance(
-                endpoint,
-                str
-            ):
-                discovered_targets.append(
-                    {
-                        "url": endpoint
-                    }
-                )
+    # Seed 2: SPA search route
+    spa_search_seed = {
+        "url": f"{base_url}/#/search?q=",
+        "type": "endpoint"
+    }
+    add_target(spa_search_seed)
 
+    # Seed 3: Stored-XSS review workflow
+    stored_reviews_seed = {
+        "url": f"{base_url}/rest/products/1/reviews",
+        "type": "stored",
+        "xss_target_type": "stored"
+    }
+    add_target(stored_reviews_seed)
+
+    # Deduplicate using target identity preserving input indices and parameters
     unique_targets = []
-    seen_urls = set()
+    seen_identities = set()
 
-    for target in discovered_targets:
-
-        url = str(
-            target.get("url", "")
-        ).strip()
-
-        if not url:
-            continue
-
-        if url in seen_urls:
-            continue
-
-        seen_urls.add(url)
-
-        unique_targets.append(
-            target
+    for item in raw_candidates:
+        url = str(item.get("url", "")).strip()
+        ident = (
+            url,
+            item.get("type"),
+            item.get("xss_target_type"),
+            item.get("name"),
+            item.get("index"),
+            item.get("selector"),
+            item.get("parameter"),
         )
+        if ident in seen_identities:
+            continue
+        seen_identities.add(ident)
+        unique_targets.append(item)
 
     state["xss_state"] = {
+        # Immutable raw reconnaissance set (used for the "endpoints" count).
         "discovered_targets": unique_targets,
+        "recon_targets": list(unique_targets),
+        # Expanded candidate pool is built lazily by the XSS agent.
+        "candidate_pool": [],
+        "_candidate_pool_built": False,
         "tested_targets": [],
+        "skipped_targets": [],
         "successful_targets": [],
+        "confirmed_vulnerabilities": [],
+        "potential_findings": [],
         "remaining_targets": list(
             unique_targets
         ),
+        "inconclusive_targets": [],
+        "unclassified_targets": [],
         "observations": [],
         "current_target": None,
         "iteration": 0,
@@ -357,486 +460,221 @@ def run_xss_specialist(
     print("XSS SPECIALIST")
     print("=" * 70)
 
-    print(
-        "Discovered XSS targets:",
-        len(
-            xss_state[
-                "discovered_targets"
-            ]
-        )
+    # Preserve the immutable raw reconnaissance set for honest counting.
+    xss_state.setdefault(
+        "recon_targets",
+        list(xss_state.get("discovered_targets", []))
     )
 
-    while xss_state[
-        "remaining_targets"
-    ]:
+    # Build the expanded candidate pool once (inputs, params, fragments, DOM
+    # assets). discovered_targets is never mutated by selection.
+    candidate_pool = _build_candidate_pool(state)
 
-        decision = choose_next_target(
-            state
-        )
+    print(
+        "Raw reconnaissance endpoints:",
+        len(xss_state.get("recon_targets", []))
+    )
+    print(
+        "Expanded XSS candidates:",
+        len(candidate_pool)
+    )
 
-        action = decision.get(
-            "action"
-        )
-
-        target_index = decision.get(
-            "target_index"
-        )
-
-        reason = decision.get(
-            "reason",
-            ""
-        )
-
-        discovered = xss_state[
-            "discovered_targets"
+    def _remaining_candidates():
+        processed = {
+            _target_identity(t)
+            for t in (
+                xss_state.get("tested_targets", [])
+                + xss_state.get("skipped_targets", [])
+            )
+        }
+        return [
+            c for c in candidate_pool
+            if _target_identity(c) not in processed
         ]
 
-        tested = xss_state[
-            "tested_targets"
-        ]
+    while _remaining_candidates():
 
-        remaining = [
-            index
-            for index, target in enumerate(discovered)
-            if target not in tested
-        ]
+        decision = choose_next_target(state)
 
-        if not remaining:
-            break
+        action = decision.get("action")
+        target_index = decision.get("target_index")
+        reason = decision.get("reason", "")
 
         if action == "finish":
-            target_index = remaining[0]
-            reason = (
-                "GPT requested finish while unexplored "
-                "XSS targets remained. Continuing with "
-                "the next unexplored target."
-            )
-
-        if target_index is None:
-            target_index = remaining[0]
-            reason = (
-                "No valid target was selected. Continuing "
-                "with the next unexplored XSS target."
-            )
-
-        try:
-            target_index = int(
-                target_index
-            )
-
-        except (
-            TypeError,
-            ValueError
-        ):
-            target_index = remaining[0]
-            reason = (
-                "Invalid target index returned by GPT. "
-                "Continuing with the next unexplored target."
-            )
+            break
 
         if (
-            target_index < 0
-            or target_index >= len(
-                discovered
-            )
-            or discovered[target_index] in tested
+            not isinstance(target_index, int)
+            or target_index < 0
+            or target_index >= len(candidate_pool)
         ):
-            target_index = remaining[0]
-            reason = (
-                "GPT selected an invalid or already-tested "
-                "target. Continuing with the next unexplored target."
+            # Selection could not point at a valid candidate; stop cleanly.
+            break
+
+        target = candidate_pool[target_index]
+
+        # Never re-test a candidate already analyzed.
+        processed_ids = {
+            _target_identity(t)
+            for t in (
+                xss_state.get("tested_targets", [])
+                + xss_state.get("skipped_targets", [])
             )
+        }
+        if _target_identity(target) in processed_ids:
+            continue
 
-        target = discovered[
-            target_index
-        ]
+        xss_state["current_target"] = target
 
-        xss_state[
-            "current_target"
-        ] = target
+        test_selected_target(state, target, reason)
 
-        test_selected_target(
-            state,
-            target,
-            reason
-        )
+    # Classify raw endpoints that could not produce a testable candidate
+    # (static JS awaiting DOM analysis, non-script assets, unresolved APIs).
+    classify_unexpandable_targets(state)
 
-    xss_state[
-        "completed"
-    ] = (
-        len(
-            xss_state[
-                "remaining_targets"
-            ]
-        ) == 0
+    remaining_candidates = _remaining_candidates()
+    unclassified = list(xss_state.get("unclassified_targets", []))
+
+    # Completion means every testable candidate was analyzed. Unclassified
+    # endpoints (no XSS input surface: param-less APIs, etc.) are accounted
+    # for with a reason and do not represent outstanding work, so they do not
+    # block completion.
+    xss_state["completed"] = len(remaining_candidates) == 0
+
+    recon_count = len(xss_state.get("recon_targets", []))
+    candidate_count = len(candidate_pool)
+    tested = xss_state.get("tested_targets", [])
+    skipped = xss_state.get("skipped_targets", [])
+    confirmed_vulnerabilities = list(
+        xss_state.get("confirmed_vulnerabilities", [])
     )
+    suspected = list(xss_state.get("successful_targets", []))
+    potential_findings = list(xss_state.get("potential_findings", []))
 
     print(
         "\nXSS Specialist Status:",
-        "COMPLETED"
-        if xss_state["completed"]
-        else "INCOMPLETE"
+        "COMPLETED" if xss_state["completed"] else "INCOMPLETE"
     )
-
-    print(
-        "Targets discovered:",
-        len(
-            xss_state[
-                "discovered_targets"
-            ]
-        )
-    )
-
-    print(
-        "Targets tested:",
-        len(
-            xss_state[
-                "tested_targets"
-            ]
-        )
-    )
-
-    print(
-        "Successful targets:",
-        len(
-            xss_state[
-                "successful_targets"
-            ]
-        )
-    )
-
-    print(
-        "Remaining targets:",
-        len(
-            xss_state[
-                "remaining_targets"
-            ]
-        )
-    )
+    print("Raw reconnaissance endpoints:", recon_count)
+    print("Expanded XSS candidates:", candidate_count)
+    print("Candidates analyzed (tested):", len(tested))
+    print("Candidates skipped:", len(skipped))
+    print("Inconclusive:", len(xss_state.get("inconclusive_targets", [])))
+    print("Potential (unverified) findings:", len(potential_findings))
+    print("Suspected findings:", len(suspected))
+    print("Confirmed vulnerabilities:", len(confirmed_vulnerabilities))
+    print("Unclassified endpoints:", len(unclassified))
+    print("Candidates remaining:", len(remaining_candidates))
 
     return {
         "specialist": "xss",
-
-        "target_count": len(
-            xss_state[
-                "discovered_targets"
-            ]
-        ),
-
-        "tested_count": len(
-            xss_state[
-                "tested_targets"
-            ]
-        ),
-
-        "successful_count": len(
-            xss_state[
-                "successful_targets"
-            ]
-        ),
-
-        "remaining_count": len(
-            xss_state[
-                "remaining_targets"
-            ]
-        ),
-
-        "findings": list(
-            xss_state[
-                "successful_targets"
-            ]
-        ),
-
-        "observations": list(
-            xss_state[
-                "observations"
-            ]
-        ),
-
-        "completed": xss_state[
-            "completed"
-        ],
+        # Raw recon endpoints (stable; no longer inflated by expansion).
+        "target_count": recon_count,
+        "raw_endpoint_count": recon_count,
+        # Distinct expanded XSS candidates.
+        "candidate_count": candidate_count,
+        # Candidates actually analyzed.
+        "tested_count": len(tested),
+        "skipped_count": len(skipped),
+        "successful_count": len(suspected),
+        "confirmed_count": len(confirmed_vulnerabilities),
+        "potential_count": len(potential_findings),
+        "unclassified_count": len(unclassified),
+        "remaining_count": len(remaining_candidates),
+        "findings": confirmed_vulnerabilities,
+        "potential_findings": potential_findings,
+        "suspected_findings": suspected,
+        "confirmed_vulnerabilities": confirmed_vulnerabilities,
+        "unclassified_targets": unclassified,
+        "observations": list(xss_state.get("observations", [])),
+        "completed": xss_state["completed"],
     }
 
 def build_decision_prompt(state):
+    executed = state.get("modules_run", [])
+    pending = state.get("pending_chain")
+    available = [m for m in CORE_MODULES if m not in executed]
 
-    executed = state.get(
-        "modules_run",
-        []
-    )
+    if isinstance(pending, dict):
+        next_module = pending.get("next_module")
+        if next_module and next_module not in available:
+            available.append(next_module)
 
-    pending_chain = state.get(
-        "pending_chain"
-    )
+    if not available:
+        return """Return ONLY JSON:
+{"action":"stop","reason":"All useful modules completed."}"""
 
-    available_modules = [
-        module
-        for module in CORE_MODULES
-        if module not in executed
-    ]
+    recon = state.get("recon_state", {})
+    sqli = state.get("sqli_state", {})
+    xss = state.get("xss_state", {})
+    idor = state.get("idor_state", {})
 
-    if isinstance(
-        pending_chain,
-        dict
-    ):
-        next_module = pending_chain.get(
-            "next_module"
-        )
+    attack_surface = recon.get("attack_surface", {})
 
-        if (
-            next_module
-            and next_module not in available_modules
-        ):
-            available_modules.append(
-                next_module
-            )
-
-    if not available_modules:
-        return """
-Return ONLY valid JSON:
-
-{
-    "action": "stop",
-    "reason": "All available specialist modules have been executed."
-}
-"""
-
-    recon = state.get(
-        "recon_state",
-        {}
-    )
-
-    sqli = state.get(
-        "sqli_state",
-        {}
-    )
-
-    xss = state.get(
-        "xss_state",
-        {}
-    )
-
-    idor = state.get(
-        "idor_state",
-        {}
-    )
-
-    recon_info = {
-        "completed": bool(
-            recon.get("completed")
-        ),
-        "targets_discovered": len(
-            recon.get(
-                "discovered_targets",
-                []
-            )
-        ),
-        "targets_tested": len(
-            recon.get(
-                "tested_targets",
-                []
-            )
-        ),
-        "auth_endpoints": len(
-            recon.get(
-                "auth_endpoints",
-                []
-            )
-        ),
-        "user_endpoints": len(
-            recon.get(
-                "user_endpoints",
-                []
-            )
-        ),
-        "injection_targets": len(
-            recon.get(
-                "attack_surface",
-                {}
-            ).get(
-                "injection",
-                []
-            )
-        ),
-        "client_side_targets": len(
-            recon.get(
-                "attack_surface",
-                {}
-            ).get(
-                "client_side",
-                []
-            )
-        ),
-        "authorization_targets": len(
-            recon.get(
-                "attack_surface",
-                {}
-            ).get(
-                "authorization",
-                []
-            )
-        ),
-    }
+    graph = state.get("attack_graph")
+    graph_data = {}
+    if graph:
+        graph.infer_relationships()
+        candidates = graph.validate_hypotheses(state)
+        graph_data = {
+            # Compact: only target + score (full hypothesis dicts carry long
+            # reason strings that waste prompt tokens on every step).
+            "candidate_actions": [
+                {"t": c.get("target"), "s": c.get("score")}
+                for c in candidates[:4]
+            ]
+        }
 
     summary = {
-        "target": state.get(
-            "target_url",
-            ""
-        ),
-        "executed_modules": executed,
-        "available_modules": available_modules,
-        "findings_count": len(
-            state.get(
-                "findings",
-                []
-            )
-        ),
-        "recon": recon_info,
+        "executed": executed,
+        "available": available,
+        "findings": len(state.get("findings", [])),
+        "attack_graph": graph_data,
+        "recon": {
+            "completed": bool(recon.get("completed")),
+            "discovered": len(recon.get("discovered_targets", [])),
+            "tested": len(recon.get("tested_targets", [])),
+            "auth": len(recon.get("auth_endpoints", [])),
+            "user": len(recon.get("user_endpoints", [])),
+            "injection": len(attack_surface.get("injection", [])),
+            "client_side": len(attack_surface.get("client_side", [])),
+            "authorization": len(attack_surface.get("authorization", []))
+        },
         "sqli": {
-            "completed": bool(
-                sqli.get("completed")
-            ),
-            "successful_targets": len(
-                sqli.get(
-                    "successful_targets",
-                    []
-                )
-            ),
+            "completed": bool(sqli.get("completed")),
+            "successful": len(sqli.get("successful_targets", []))
         },
         "xss": {
-            "completed": bool(
-                xss.get("completed")
-            ),
-            "successful_targets": len(
-                xss.get(
-                    "successful_targets",
-                    []
-                )
-            ),
+            "completed": bool(xss.get("completed")),
+            "successful": len(xss.get("successful_targets", []))
         },
         "idor": {
-            "completed": bool(
-                idor.get("completed")
-            ),
-            "successful_targets": len(
-                idor.get(
-                    "successful_targets",
-                    []
-                )
-            ),
+            "completed": bool(idor.get("completed")),
+            "successful": len(idor.get("successful_targets", []))
         },
-        "authenticated_session_available": bool(
-            state.get(
-                "authenticated_session"
-            )
-            or sqli.get(
-                "authenticated_session"
-            )
-            or idor.get(
-                "authenticated_session"
-            )
+        "authenticated_session": bool(
+            state.get("authenticated_session")
+            or sqli.get("authenticated_session")
+            or idor.get("authenticated_session")
         ),
-        "pending_chain": {
-            "exists": isinstance(
-                pending_chain,
-                dict
-            ),
-            "type": (
-                pending_chain.get("type")
-                if isinstance(
-                    pending_chain,
-                    dict
-                )
-                else None
-            ),
-            "source": (
-                pending_chain.get("source")
-                if isinstance(
-                    pending_chain,
-                    dict
-                )
-                else None
-            ),
-            "next_module": (
-                pending_chain.get(
-                    "next_module"
-                )
-                if isinstance(
-                    pending_chain,
-                    dict
-                )
-                else None
-            ),
-            "reason": (
-                pending_chain.get(
-                    "reason"
-                )
-                if isinstance(
-                    pending_chain,
-                    dict
-                )
-                else None
-            ),
-        },
+        "chain": {
+            "exists": isinstance(pending, dict),
+            "type": pending.get("type") if isinstance(pending, dict) else None,
+            "source": pending.get("source") if isinstance(pending, dict) else None,
+            "next": pending.get("next_module") if isinstance(pending, dict) else None,
+            "reason": pending.get("reason") if isinstance(pending, dict) else None
+        }
     }
 
-    return f"""
-You are the central orchestrator for an
-authorized local web application security
-assessment.
+    return f"""Orchestrator for an authorized local web security assessment.
+Pick the next module from "available" (highest-scoring graph action whose
+prerequisites hold; honor a pending chain's next module). Never repeat
+completed modules or expose tokens.
 
-Choose the next useful specialist module
-based on the current state.
+State:
+{json.dumps(summary, separators=(",", ":"), default=str)}
 
-Never invent targets.
-Never invent vulnerabilities.
-Never expose authentication tokens.
-
-Current compact state:
-
-{json.dumps(
-    summary,
-    separators=(",", ":"),
-    default=str
-)}
-
-Rules:
-
-1. Recon before vulnerability testing.
-2. Authentication after recon when authentication
-   endpoints exist.
-3. SQLi after recon when injection targets exist.
-4. XSS when client-side or injection targets exist.
-5. Authorization when authorization/user targets exist.
-6. Do not repeat completed modules.
-7. Prefer a module with meaningful untested targets.
-8. If a pending adaptive chain exists, strongly
-   consider its next_module because the state
-   indicates why it was created.
-9. Choose based on the complete compact state.
-   Do not blindly follow or ignore the chain.
-10. Never select idor_check unless it is present
-    in available_modules.
-11. Stop only when all useful available modules
-    are completed.
-
-Available actions:
-
-recon
-auth
-sqli_check
-xss_check
-authorization
-idor_check
-stop
-
-Return ONLY valid JSON:
-
-{{
-    "action": "module_name",
-    "reason": "short explanation"
-}}
-"""
+Return ONLY JSON: {{"action":"module_name","reason":"short explanation"}}"""
 
 
 def parse_decision(response):
@@ -873,11 +711,24 @@ def decide_next_module(state):
         state
     )
 
-    response = llm.invoke(
-        [
-            (
-                "system",
-                """
+    pending_chain = state.get("pending_chain")
+    if pending_chain and pending_chain.get("next_module"):
+        next_module = pending_chain.get("next_module")
+        prompt += f"\n\nCRITICAL INSTRUCTION: You MUST select '{next_module}' as the action because it is the next step in the pending chain. Provide a custom reason explaining why based on the current state."
+    else:
+        graph_action = get_graph_next_action(state)
+        if graph_action:
+            print(
+                f"[ATTACK GRAPH] Selected next action: {graph_action}"
+            )
+            prompt += f"\n\nCRITICAL INSTRUCTION: You MUST select '{graph_action}' as the action because it is the highest scored attack-graph hypothesis. Provide a custom reason explaining why based on the current state."
+
+    try:
+        response = llm.invoke(
+            [
+                (
+                    "system",
+                    """
 You are the central orchestration AI
 for an authorized local web application
 security testing system.
@@ -890,17 +741,38 @@ Never expose authentication tokens.
 
 Return ONLY valid JSON.
 """
-            ),
-            (
-                "human",
-                prompt
-            )
-        ]
-    )
+                ),
+                (
+                    "human",
+                    prompt
+                )
+            ]
+        )
 
-    decision = parse_decision(
-        response
-    )
+        decision = parse_decision(
+            response
+        )
+    except Exception as e:
+        print(f"[ORCHESTRATOR] GPT decision failed: {e}")
+        
+        if pending_chain and pending_chain.get("next_module"):
+            decision = {
+                "action": pending_chain.get("next_module"),
+                "reason": f"Executing pending chain (Fallback): {pending_chain.get('chain')}"
+            }
+        elif graph_action:
+            decision = {
+                "action": graph_action,
+                "reason": "Selected by validated attack-graph hypothesis (Fallback)."
+            }
+        else:
+            # Fallback to next core module not yet run
+            decision = {"action": "stop", "reason": "All modules completed."}
+            modules_run = state.get("modules_run", [])
+            for mod in CORE_MODULES:
+                if mod not in modules_run:
+                    decision = {"action": mod, "reason": "Local fallback orchestration."}
+                    break
 
     action = decision.get(
         "action"
@@ -961,9 +833,14 @@ def execute_module(
 
     if action == "recon":
 
-        return run_recon_specialist(
+        result = run_recon_specialist(
             state
         )
+        update_attack_graph_from_recon(
+            state,
+            result
+        )
+        return result
 
     if action == "auth":
 
@@ -971,9 +848,26 @@ def execute_module(
             state
         )
 
+        # Seed auth with emails discovered elsewhere (e.g. an exposed user
+        # listing from the authorization module) so its user-enumeration probe
+        # has real candidates to differentiate against.
+        emails = _collect_discovered_emails(state)
+        if emails and isinstance(recon_result, dict):
+            recon_result = dict(recon_result)
+            data = dict(recon_result.get("data") or {})
+            data["discovered_emails"] = emails
+            recon_result["data"] = data
+
         result = run_auth_specialist(
             recon_result
         )
+
+        # Persist auth module state (used by the dashboard and the graph's
+        # session check); drop any session material before storing.
+        if isinstance(result, dict) and isinstance(result.get("state"), dict):
+            auth_persist = dict(result["state"])
+            auth_persist.pop("authenticated_session", None)
+            state["auth_state"] = auth_persist
 
         return sanitize_session_from_result(
             result
@@ -1068,6 +962,14 @@ def execute_module(
             )
         )
 
+        # Persist the module state so the dashboard's Authorization section can
+        # read real metrics (targets tested, suspected BOLA, confirmed bypass).
+        # The authenticated session is dropped — it must not leak into the UI.
+        if isinstance(result, dict) and isinstance(result.get("state"), dict):
+            authz_persist = dict(result["state"])
+            authz_persist.pop("authenticated_session", None)
+            state["authz_state"] = authz_persist
+
         return sanitize_session_from_result(
             result
         )
@@ -1089,12 +991,75 @@ def update_state_after_module(
         result
     )
 
+    graph = state.get("attack_graph")
+    if graph and hasattr(graph, "add_node"):
+        graph.add_node(
+            f"module:{action}",
+            action,
+            {
+                "completed": bool(
+                    isinstance(result, dict)
+                    and result.get("completed")
+                ),
+                "findings": len(
+                    result.get("findings", [])
+                )
+                if isinstance(result, dict)
+                else 0
+            }
+        )
+
     if not isinstance(result, dict):
         result = {
             "specialist": action,
             "completed": False,
             "error": "Invalid module result."
         }
+
+    result_data = result.get("data")
+    evidence_data = result_data if isinstance(result_data, dict) else result
+    confirmed = evidence_data.get("confirmed") is True
+    bypass_verified = (
+        evidence_data.get("authentication_bypass_verified") is True
+    )
+
+    # A multi-step chain is triggered when the specialist flags it AND the
+    # evidence is strong enough: either the vulnerability is confirmed, or a
+    # SQLi-caused authentication bypass has been independently verified
+    # (benign credentials fail while the injection payload authenticates).
+    # An ordinary successful login or a lone session cookie is NOT enough and
+    # never sets authentication_bypass_verified.
+    chain_data_obj = (
+        result.get("chain_data")
+        if isinstance(result.get("chain_data"), dict)
+        else None
+    )
+
+    if (
+        result.get("chain_trigger") is True
+        and chain_data_obj is not None
+        and (confirmed or bypass_verified)
+    ):
+        # pending_chain holds the authenticated session internally so the IDOR
+        # step can use it; it is never printed/reported.
+        state["pending_chain"] = chain_data_obj
+        state["metrics"]["chains_triggered"] += 1
+
+        # Record the trigger in chain_history (redacted: no session/token).
+        state.setdefault("chain_history", []).append({
+            "type": chain_data_obj.get("chain"),
+            "source": action,
+            "next_module": chain_data_obj.get("next_module"),
+            "status": "triggered",
+        })
+
+    # Never let a raw session/token reach findings, logs, the dashboard, or
+    # reports: the findings-facing copy of chain_data is redacted while
+    # pending_chain (above) keeps the intact session for internal use only.
+    if chain_data_obj is not None:
+        result = dict(result)
+        result["chain_data"] = _redact_chain_data(chain_data_obj)
+
 
     category_map = {
         "xss_check": "xss",
@@ -1265,88 +1230,8 @@ def update_state_after_module(
         f"{action} - {reason}"
     )
 
-
-def handle_sqli_chain(
-    state,
-    result
-):
-
-    if not isinstance(
-        result,
-        dict
-    ):
-        return
-
-    data = result.get(
-        "data",
-        {}
-    )
-
-    if not isinstance(
-        data,
-        dict
-    ):
-        data = {}
-
-    chain_data = (
-        data.get(
-            "chain_data"
-        )
-        or result.get(
-            "chain_data"
-        )
-    )
-
-    if not isinstance(
-        chain_data,
-        dict
-    ):
-        return
-
-    authenticated_session = (
-        chain_data.get(
-            "authenticated_session"
-        )
-    )
-
-    if not authenticated_session:
-        return
-
-    if not state.get(
-        "chaining_enabled",
-        True
-    ):
-        return
-
-    state[
-        "pending_chain"
-    ] = {
-        "type": "sqli_to_idor",
-        "source": "sqli_check",
-        "next_module": "idor_check",
-        "reason": (
-            "SQL injection testing produced "
-            "an authenticated session."
-        ),
-        "authenticated_session":
-            authenticated_session,
-    }
-
-    state[
-        "metrics"
-    ][
-        "chains_triggered"
-    ] += 1
-
-    state[
-        "pending_chains"
-    ].append(
-        {
-            "type": "sqli_to_idor",
-            "source": "sqli_check",
-            "next_module": "idor_check",
-        }
-    )
+    if graph and hasattr(graph, "infer_relationships"):
+        graph.infer_relationships()
 
 
 def complete_idor_chain(
@@ -1393,6 +1278,57 @@ def complete_idor_chain(
     ] = None
 
 
+def get_graph_next_action(state):
+    graph = state.get("attack_graph")
+    
+    if not graph:
+        return None
+        
+    chains = graph.generate_chains(state)
+    
+    if not chains:
+        return None
+        
+    ranked = graph.rank_chains(
+        chains,
+        state
+    )
+    
+    if not ranked:
+        return None
+        
+    best = ranked[0]
+    chain = best["chain"]
+    score = best["score"]
+    
+    state["selected_chain"] = chain
+    # Graph hypotheses are transparency/debug data, NOT triggered chains.
+    # Keeping them out of chain_history ensures chain counters and history
+    # reflect only chains that actually fired.
+    state.setdefault("graph_selections", []).append({
+        "chain": chain,
+        "score": score
+    })
+
+    if not chain:
+        return None
+        
+    for action in chain:
+        if action not in state.get("modules_run", []):
+            print(
+                f"[ATTACK GRAPH] Selected chain: {chain}"
+            )
+            print(
+                f"[ATTACK GRAPH] Chain score: {score}"
+            )
+            print(
+                f"[ATTACK GRAPH] Next action: {action}"
+            )
+            return action
+            
+    return None
+
+
 def run_agent(
     target_url="http://localhost:3000"
 ):
@@ -1401,6 +1337,7 @@ def run_agent(
         target_url=target_url,
         chaining_enabled=True
     )
+    state["attack_graph"] = AttackGraph()
 
     print(
         "\n" + "=" * 70
@@ -1495,13 +1432,6 @@ def run_agent(
             state,
             decision
         )
-
-        if action == "sqli_check":
-
-            handle_sqli_chain(
-                state,
-                result
-            )
 
         update_state_after_module(
             state,
