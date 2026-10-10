@@ -590,91 +590,64 @@ def run_xss_specialist(
         "completed": xss_state["completed"],
     }
 
-def build_decision_prompt(state):
-    executed = state.get("modules_run", [])
-    pending = state.get("pending_chain")
-    available = [m for m in CORE_MODULES if m not in executed]
-
-    if isinstance(pending, dict):
-        next_module = pending.get("next_module")
-        if next_module and next_module not in available:
-            available.append(next_module)
-
-    if not available:
-        return """Return ONLY JSON:
-{"action":"stop","reason":"All useful modules completed."}"""
-
+def build_decision_prompt(state, shortlist, available):
+    """Prompt the orchestrator LLM to GENUINELY choose the next action from a
+    ranked, evidence-annotated shortlist. The graph scores are advisory inputs,
+    not a mandate: the model may pick a lower-scored option, or stop, when it
+    can justify doing so from the evidence."""
     recon = state.get("recon_state", {})
     sqli = state.get("sqli_state", {})
     xss = state.get("xss_state", {})
     idor = state.get("idor_state", {})
-
     attack_surface = recon.get("attack_surface", {})
 
-    graph = state.get("attack_graph")
-    graph_data = {}
-    if graph:
-        graph.infer_relationships()
-        candidates = graph.validate_hypotheses(state)
-        graph_data = {
-            # Compact: only target + score (full hypothesis dicts carry long
-            # reason strings that waste prompt tokens on every step).
-            "candidate_actions": [
-                {"t": c.get("target"), "s": c.get("score")}
-                for c in candidates[:4]
-            ]
-        }
-
     summary = {
-        "executed": executed,
-        "available": available,
+        "executed": state.get("modules_run", []),
         "findings": len(state.get("findings", [])),
-        "attack_graph": graph_data,
-        "recon": {
-            "completed": bool(recon.get("completed")),
-            "discovered": len(recon.get("discovered_targets", [])),
-            "tested": len(recon.get("tested_targets", [])),
-            "auth": len(recon.get("auth_endpoints", [])),
-            "user": len(recon.get("user_endpoints", [])),
-            "injection": len(attack_surface.get("injection", [])),
-            "client_side": len(attack_surface.get("client_side", [])),
-            "authorization": len(attack_surface.get("authorization", []))
-        },
-        "sqli": {
-            "completed": bool(sqli.get("completed")),
-            "successful": len(sqli.get("successful_targets", []))
-        },
-        "xss": {
-            "completed": bool(xss.get("completed")),
-            "successful": len(xss.get("successful_targets", []))
-        },
-        "idor": {
-            "completed": bool(idor.get("completed")),
-            "successful": len(idor.get("successful_targets", []))
-        },
         "authenticated_session": bool(
             state.get("authenticated_session")
             or sqli.get("authenticated_session")
             or idor.get("authenticated_session")
         ),
-        "chain": {
-            "exists": isinstance(pending, dict),
-            "type": pending.get("type") if isinstance(pending, dict) else None,
-            "source": pending.get("source") if isinstance(pending, dict) else None,
-            "next": pending.get("next_module") if isinstance(pending, dict) else None,
-            "reason": pending.get("reason") if isinstance(pending, dict) else None
-        }
+        "surface": {
+            "injection": len(attack_surface.get("injection", [])),
+            "client_side": len(attack_surface.get("client_side", [])),
+            "authorization": len(attack_surface.get("authorization", [])),
+            "auth_endpoints": len(recon.get("auth_endpoints", [])),
+            "user_endpoints": len(recon.get("user_endpoints", [])),
+        },
+        "results": {
+            "sqli_successful": len(sqli.get("successful_targets", [])),
+            "xss_successful": len(xss.get("successful_targets", [])),
+            "idor_successful": len(idor.get("successful_targets", [])),
+        },
     }
 
-    return f"""Orchestrator for an authorized local web security assessment.
-Pick the next module from "available" (highest-scoring graph action whose
-prerequisites hold; honor a pending chain's next module). Never repeat
-completed modules or expose tokens.
+    # Ranked options the model chooses among (score = graph priority, 0..1).
+    options = [
+        {"action": s["action"], "score": s["score"], "why": s.get("reason", "")}
+        for s in shortlist
+    ]
 
-State:
+    return f"""You are the strategy orchestrator for an authorized local web
+security assessment. Decide the single most valuable next action.
+
+Assessment state:
 {json.dumps(summary, separators=(",", ":"), default=str)}
 
-Return ONLY JSON: {{"action":"module_name","reason":"short explanation"}}"""
+Ranked candidate actions (graph priority score 0-1 is ADVISORY — you may choose
+a different available action, or a lower-scored one, if the evidence justifies
+it; choose "stop" only when no available action would add value):
+{json.dumps(options, separators=(",", ":"), default=str)}
+
+Available actions you may choose: {available + ["stop"]}
+
+Strategy guidance:
+- Prioritize actions that turn suspected findings into confirmed ones, or that
+  exploit an already-obtained authenticated session (idor/authorization).
+- Do not repeat completed modules. Never invent targets or expose tokens.
+
+Return ONLY JSON: {{"action":"<one of the available actions>","reason":"<1-2 sentence justification referencing the evidence>"}}"""
 
 
 def parse_decision(response):
@@ -705,96 +678,112 @@ def parse_decision(response):
         )
 
 
+ORCHESTRATOR_SYSTEM = (
+    "You are the central orchestration AI for an authorized local web "
+    "application security test. You coordinate specialist agents and decide "
+    "the next action. Never invent targets or vulnerabilities, never expose "
+    "authentication tokens. Return ONLY valid JSON."
+)
+
+
+def get_graph_shortlist(state, k=4):
+    """Return the top-k valid next-action candidates from the attack graph,
+    each with its score and evidence reason, for the orchestrator LLM to
+    choose among. The graph ranks; the LLM decides."""
+    graph = state.get("attack_graph")
+    if not graph:
+        return []
+    graph.infer_relationships()
+    candidates = graph.validate_hypotheses(state)  # sorted by score desc
+    executed = state.get("modules_run", [])
+
+    allowed = {m for m in CORE_MODULES if m not in executed}
+    if "idor_check" not in executed:
+        allowed.add("idor_check")
+
+    shortlist, seen = [], set()
+    for c in candidates:
+        target = c.get("target")
+        if (
+            not target
+            or target in seen
+            or target not in allowed
+            or (c.get("score") or 0) <= 0
+        ):
+            continue
+        seen.add(target)
+        shortlist.append({
+            "action": target,
+            "score": c.get("score", 0.0),
+            "reason": c.get("reason", ""),
+        })
+        if len(shortlist) >= k:
+            break
+    return shortlist
+
+
 def decide_next_module(state):
+    executed = state.get("modules_run", [])
 
-    prompt = build_decision_prompt(
-        state
-    )
-
-    pending_chain = state.get("pending_chain")
-    if pending_chain and pending_chain.get("next_module"):
-        next_module = pending_chain.get("next_module")
-        prompt += f"\n\nCRITICAL INSTRUCTION: You MUST select '{next_module}' as the action because it is the next step in the pending chain. Provide a custom reason explaining why based on the current state."
-    else:
-        graph_action = get_graph_next_action(state)
-        if graph_action:
-            print(
-                f"[ATTACK GRAPH] Selected next action: {graph_action}"
-            )
-            prompt += f"\n\nCRITICAL INSTRUCTION: You MUST select '{graph_action}' as the action because it is the highest scored attack-graph hypothesis. Provide a custom reason explaining why based on the current state."
-
-    try:
-        response = llm.invoke(
-            [
-                (
-                    "system",
-                    """
-You are the central orchestration AI
-for an authorized local web application
-security testing system.
-
-You coordinate specialist security agents.
-
-Never invent targets.
-Never invent vulnerabilities.
-Never expose authentication tokens.
-
-Return ONLY valid JSON.
-"""
-                ),
-                (
-                    "human",
-                    prompt
-                )
-            ]
-        )
-
-        decision = parse_decision(
-            response
-        )
-    except Exception as e:
-        print(f"[ORCHESTRATOR] GPT decision failed: {e}")
-        
-        if pending_chain and pending_chain.get("next_module"):
-            decision = {
-                "action": pending_chain.get("next_module"),
-                "reason": f"Executing pending chain (Fallback): {pending_chain.get('chain')}"
-            }
-        elif graph_action:
-            decision = {
-                "action": graph_action,
-                "reason": "Selected by validated attack-graph hypothesis (Fallback)."
-            }
-        else:
-            # Fallback to next core module not yet run
-            decision = {"action": "stop", "reason": "All modules completed."}
-            modules_run = state.get("modules_run", [])
-            for mod in CORE_MODULES:
-                if mod not in modules_run:
-                    decision = {"action": mod, "reason": "Local fallback orchestration."}
-                    break
-
-    action = decision.get(
-        "action"
-    )
-
-    if action == "stop":
-        return decision
-
-    if action == "idor_check":
-        return decision
-
-    if action not in CORE_MODULES:
-
+    # 1. Reconnaissance always runs first.
+    if not executed:
         return {
-            "action": "stop",
-            "reason": (
-                "Invalid module selected "
-                "by the orchestrator."
-            )
+            "action": "recon",
+            "reason": "Reconnaissance is required before any testing.",
         }
 
-    return decision
+    # 2. A verified multi-step chain is a hard follow-up and is never skipped
+    #    (reliability guarantee for evidence-backed exploit chains).
+    pending_chain = state.get("pending_chain")
+    if pending_chain and pending_chain.get("next_module"):
+        nm = pending_chain.get("next_module")
+        return {
+            "action": nm,
+            "reason": (
+                f"Verified {pending_chain.get('chain', 'exploit')} chain: "
+                f"executing the required follow-up '{nm}'."
+            ),
+        }
+
+    available = [m for m in CORE_MODULES if m not in executed]
+    if not available:
+        return {"action": "stop", "reason": "All useful modules completed."}
+
+    shortlist = get_graph_shortlist(state)
+    allowed = set(available) | {"stop"}
+    if "idor_check" not in executed:
+        allowed.add("idor_check")
+
+    # 3. The LLM GENUINELY chooses among the ranked, evidence-annotated options
+    #    (scores are advisory). The graph informs; the model strategizes.
+    prompt = build_decision_prompt(state, shortlist, available)
+    decision = None
+    try:
+        response = llm.invoke([
+            ("system", ORCHESTRATOR_SYSTEM),
+            ("human", prompt),
+        ])
+        decision = parse_decision(response)
+    except Exception as e:
+        print(f"[ORCHESTRATOR] LLM decision failed: {e}")
+
+    action = decision.get("action") if isinstance(decision, dict) else None
+
+    # 4. Validate the model's choice; fall back to the graph's top action.
+    if action in allowed:
+        print(f"[ORCHESTRATOR] LLM selected: {action}")
+        return decision
+
+    if action is not None:
+        print(
+            f"[ORCHESTRATOR] LLM returned invalid action '{action}'; "
+            "using the highest-priority graph action."
+        )
+    fallback = shortlist[0]["action"] if shortlist else available[0]
+    return {
+        "action": fallback,
+        "reason": "Highest-priority valid action (orchestrator fallback).",
+    }
 
 
 def execute_module(
@@ -1329,6 +1318,146 @@ def get_graph_next_action(state):
     return None
 
 
+def _assessment_digest(state):
+    """Compact, redacted evidence digest for the executive-summary LLM call.
+    Counts and endpoints only — never raw data, sessions, or tokens."""
+    sqli = state.get("sqli_state", {}) or {}
+    xss = state.get("xss_state", {}) or {}
+    idor = state.get("idor_state", {}) or {}
+    authz = state.get("authz_state", {}) or {}
+    auth = state.get("auth_state", {}) or {}
+    metrics = state.get("metrics", {}) or {}
+
+    def _endpoints(items, n=3):
+        out = []
+        for it in (items or [])[:n]:
+            if isinstance(it, dict):
+                tgt = it.get("target") if isinstance(it.get("target"), dict) else it
+                url = (
+                    (tgt or {}).get("url")
+                    or it.get("endpoint")
+                    or it.get("url")
+                )
+                if url:
+                    out.append(str(url))
+        return out
+
+    return {
+        "target": state.get("target_url"),
+        "modules_run": state.get("modules_run", []),
+        "chains_triggered": metrics.get("chains_triggered", 0),
+        "chains_completed": metrics.get("chains_completed", 0),
+        "sqli": {
+            "confirmed": len(sqli.get("confirmed_vulnerabilities", [])),
+            "auth_bypass_suspected": len(sqli.get("successful_targets", [])),
+        },
+        "idor": {
+            "unauthorized_access": len(idor.get("successful_targets", [])),
+            "endpoints": _endpoints(idor.get("successful_targets", [])),
+        },
+        "xss": {
+            "confirmed": len(xss.get("confirmed_vulnerabilities", [])),
+            "potential": len(xss.get("potential_findings", [])),
+            "suspected": len(xss.get("successful_targets", [])),
+        },
+        "authorization": {
+            "suspected": len(authz.get("successful_targets", [])),
+            "confirmed": len(authz.get("confirmed_vulnerabilities", [])),
+        },
+        "auth": {"findings": len(auth.get("findings", []))},
+    }
+
+
+def _fallback_summary(digest):
+    """Deterministic summary used when the LLM is unavailable."""
+    parts = [
+        f"Authorized assessment of {digest.get('target')} executed "
+        f"{len(digest.get('modules_run', []))} testing modules."
+    ]
+    if digest["sqli"]["confirmed"] or digest["sqli"]["auth_bypass_suspected"]:
+        parts.append(
+            "A SQL-injection authentication bypass was observed on the login flow."
+        )
+    if digest["idor"]["unauthorized_access"]:
+        parts.append(
+            f"IDOR testing confirmed {digest['idor']['unauthorized_access']} "
+            "unauthorized cross-user resource access(es)."
+        )
+    if digest["chains_completed"]:
+        parts.append(
+            "A multi-step attack chain (SQLi to IDOR) was triggered and completed."
+        )
+    if digest["xss"]["confirmed"] or digest["xss"]["potential"]:
+        parts.append(
+            f"XSS testing produced {digest['xss']['confirmed']} confirmed and "
+            f"{digest['xss']['potential']} potential findings."
+        )
+    if digest["authorization"]["suspected"] or digest["auth"]["findings"]:
+        parts.append(
+            "Authorization/authentication analysis flagged suspected access-control weaknesses."
+        )
+    parts.append(
+        "Prioritized remediation: parameterize database queries, enforce "
+        "object-level authorization checks, and apply contextual output encoding."
+    )
+    return " ".join(parts)
+
+
+def _unwrap_summary_text(text):
+    """The model sometimes returns the summary wrapped in JSON like
+    {"summary":"..."}. Extract the prose when that happens."""
+    if not text:
+        return ""
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            obj = json.loads(stripped)
+            if isinstance(obj, dict):
+                for key in ("summary", "executive_summary", "text", "narrative"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+                # fall back to the first string value
+                for val in obj.values():
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        except Exception:
+            pass
+    return stripped
+
+
+def generate_executive_summary(state):
+    """AI-authored executive summary of the assessment (the model reasoning
+    about the findings). Falls back to a deterministic summary if the LLM is
+    unavailable. Never includes raw data, sessions, or tokens."""
+    digest = _assessment_digest(state)
+    prompt = (
+        "Write a concise, professional penetration-test executive summary "
+        "(120-180 words) for an AUTHORIZED assessment. Use ONLY the evidence "
+        "digest below; do not invent findings or expose any tokens. Cover: "
+        "overall risk posture, the most significant confirmed findings, the "
+        "multi-step attack chain if one occurred, and 2-3 prioritized "
+        "recommendations. Output PLAIN PROSE TEXT ONLY — not JSON, no keys, no "
+        "markdown headers.\n\n"
+        f"Evidence digest: {json.dumps(digest, separators=(',', ':'), default=str)}"
+    )
+    try:
+        response = llm.invoke([
+            ("system", ORCHESTRATOR_SYSTEM),
+            ("human", prompt),
+        ])
+        text = str(getattr(response, "content", "") or "").strip()
+        text = _unwrap_summary_text(text)
+        if not text:
+            text = _fallback_summary(digest)
+    except Exception as e:
+        print(f"[ORCHESTRATOR] Executive summary generation failed: {e}")
+        text = _fallback_summary(digest)
+
+    state["executive_summary"] = text
+    return text
+
+
 def run_agent(
     target_url="http://localhost:3000"
 ):
@@ -1545,6 +1674,13 @@ def run_agent(
             f"{decision['action']} - "
             f"{decision['reason']}"
         )
+
+    # AI-authored executive summary (the model reasoning about the results).
+    summary = generate_executive_summary(state)
+    print("\n" + "=" * 70)
+    print("EXECUTIVE SUMMARY (AI-generated)")
+    print("=" * 70)
+    safe_print(summary)
 
     return state
 

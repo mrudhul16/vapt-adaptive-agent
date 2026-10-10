@@ -28,14 +28,16 @@ def test_dom_analysis_source_and_sink_potential_with_evidence(monkeypatch):
         return MockResponse(sample_js)
 
     monkeypatch.setattr("requests.get", mock_get)
+    # Do not launch a real browser in unit tests; simulate "no live execution".
+    monkeypatch.setattr("tools.xss_tools._verify_dom_xss_live", lambda b, s: (False, None))
 
-    state = {"target_url": "http://localhost:3000"}
+    state = {"target_url": "http://localhost:3000", "xss_state": {}}
     target = {"url": "http://localhost:3000/assets/search.js", "xss_target_type": "dom"}
 
     result = _test_dom_target(state, target)
 
     assert result["finding_type"] == "xss"
-    # Detection-only: reported as a potential/unverified lead, not confirmed.
+    # Live verification did not execute -> remains a potential/unverified lead.
     assert result["data"]["test_status"] == "potential"
     assert result["data"]["suspected"] is True
     assert result["data"]["confirmed"] is False
@@ -48,6 +50,64 @@ def test_dom_analysis_source_and_sink_potential_with_evidence(monkeypatch):
     assert "innerHTML/outerHTML assignment" in evidence["sinks"]
     assert evidence["validation_status"] == "unverified_static_lead"
     assert "snippet" in evidence
+
+
+def test_dom_analysis_confirmed_when_live_execution_fires(monkeypatch):
+    """A static source+sink lead is upgraded to CONFIRMED when live injection
+    via the identified source causes the sink to execute (a dialog fires)."""
+    sample_js = """
+    var q = new URLSearchParams(location.search).get('q');
+    document.getElementById('out').innerHTML = q;
+    """
+
+    def mock_get(url, timeout=5):
+        return MockResponse(sample_js)
+
+    monkeypatch.setattr("requests.get", mock_get)
+    # Simulate the payload executing in the browser.
+    monkeypatch.setattr("tools.xss_tools._verify_dom_xss_live", lambda b, s: (True, "query"))
+
+    state = {"target_url": "http://localhost:3000", "xss_state": {}}
+    target = {"url": "http://localhost:3000/assets/search.js", "xss_target_type": "dom"}
+
+    result = _test_dom_target(state, target)
+    data = result["data"]
+    assert data["test_status"] == "confirmed"
+    assert data["confirmed"] is True
+    assert data["vulnerable"] is True
+    assert data["evidence"]["validation_status"] == "confirmed_live"
+    assert data["evidence"]["confirmed_vector"] == "query"
+
+
+def test_dom_live_confirm_respects_attempt_cap(monkeypatch):
+    """Once the per-run live-confirmation cap is reached, no further live
+    attempts are made (the lead stays potential)."""
+    import tools.xss_tools as xt
+    sample_js = "var h=location.hash; document.write(h);"
+
+    monkeypatch.setattr("requests.get", lambda url, timeout=5: MockResponse(sample_js))
+    calls = {"n": 0}
+
+    def fake_live(b, s):
+        calls["n"] += 1
+        return (False, None)
+
+    monkeypatch.setattr("tools.xss_tools._verify_dom_xss_live", fake_live)
+
+    state = {"target_url": "http://localhost:3000",
+             "xss_state": {"_dom_live_attempts": xt.DOM_LIVE_CONFIRM_LIMIT}}
+    target = {"url": "http://localhost:3000/a.js", "xss_target_type": "dom"}
+    result = _test_dom_target(state, target)
+    assert result["data"]["test_status"] == "potential"
+    assert calls["n"] == 0  # cap reached -> no live attempt
+
+
+def test_dom_xss_vectors_pure_logic():
+    from tools.xss_tools import _dom_xss_vectors
+    marker, vectors = _dom_xss_vectors("http://localhost:3000", ["location property"])
+    names = {n for n, _ in vectors}
+    assert "hash" in names
+    assert all(marker in url for _, url in vectors)
 
 
 def test_dom_analysis_no_patterns_negative(monkeypatch):

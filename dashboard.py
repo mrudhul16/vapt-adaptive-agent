@@ -3,6 +3,7 @@ import copy
 import html as html_module
 from datetime import datetime
 from agent import run_agent
+from modules.risk_engine import compute_severity
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -479,11 +480,14 @@ def redact_sensitive(data):
 
 
 def get_severity(category):
-    """Get severity label and CSS class for a risk category."""
-    return SEVERITY_MAP.get(
-        category.lower(),
-        ("UNKNOWN", "badge-info")
-    )
+    """Severity label + badge class for a risk CATEGORY (aggregate view).
+
+    Uses the computed severity model at a 'confirmed' baseline, since risk
+    categories are only listed when a vulnerability of that type was found.
+    Per-finding cards use the full confidence/context-aware computation.
+    """
+    sev = compute_severity(category, "confirmed")
+    return (sev["label"], sev["badge"])
 
 
 def is_finding_vulnerable(finding):
@@ -580,7 +584,8 @@ def build_evidence_findings(state):
         items.append({
             "title": "SQL Injection — Authentication Bypass",
             "module": "SQL Injection",
-            "sev": _SEV["sqli"],
+            "category": "sqli",
+            "context": {"authentication_bypass_verified": bypass},
             "status": ("CONFIRMED", "status-confirmed") if confirmed
             else ("SUSPECTED", "status-suspected"),
             "endpoint": tgt.get("url") or state.get("target_url", ""),
@@ -611,7 +616,9 @@ def build_evidence_findings(state):
         items.append({
             "title": "IDOR — Unauthorized Cross-User Resource Access",
             "module": "IDOR",
-            "sev": _SEV["idor"],
+            "category": "idor",
+            "context": {"cross_user_access": True,
+                        "multiple_records_exposed": len(idor_rows) > 1},
             "status": ("CONFIRMED", "status-confirmed"),
             "endpoint": "/rest/basket/{id}",
             "summary": (
@@ -630,7 +637,8 @@ def build_evidence_findings(state):
         items.append({
             "title": "Cross-Site Scripting — Confirmed Execution",
             "module": "XSS",
-            "sev": _SEV["xss"],
+            "category": "xss",
+            "context": {},
             "status": ("CONFIRMED", "status-confirmed"),
             "endpoint": t.get("url", ""),
             "summary": "Payload execution was observed (expected dialog triggered) during live testing.",
@@ -649,7 +657,8 @@ def build_evidence_findings(state):
         items.append({
             "title": p.get("vulnerability_type", "Potential DOM-based XSS"),
             "module": "XSS",
-            "sev": ("MEDIUM", "sev-medium"),
+            "category": "xss",
+            "context": {},
             "status": ("POTENTIAL", "status-potential"),
             "endpoint": p.get("endpoint", ""),
             "summary": p.get("detail", ""),
@@ -669,7 +678,8 @@ def build_evidence_findings(state):
         items.append({
             "title": "Cross-Site Scripting — Suspected",
             "module": "XSS",
-            "sev": _SEV["xss"],
+            "category": "xss",
+            "context": {},
             "status": ("SUSPECTED", "status-suspected"),
             "endpoint": t.get("url", ""),
             "summary": "Reflected/stored behavior suggests XSS, but execution was not confirmed.",
@@ -713,12 +723,27 @@ def build_evidence_findings(state):
         items.append({
             "title": title,
             "module": "Authorization" if ft == "authorization" else "Authentication",
-            "sev": _SEV.get(ft, ("LOW", "sev-low")),
+            "category": "authorization" if ft == "authorization" else "auth",
+            "context": {
+                "unauthenticated": bool(disclosed),
+                "multiple_records_exposed": bool(data.get("multiple_user_records_exposed")),
+            },
             "status": ("SUSPECTED", "status-suspected"),
             "endpoint": endpoint,
             "summary": detail,
             "evidence": ev,
         })
+
+    # Compute each finding's severity from type + confidence + context, instead
+    # of a hardcoded per-type label.
+    for it in items:
+        sev = compute_severity(
+            it.get("category", ""),
+            it.get("status", ("", ""))[0],
+            it.get("context"),
+        )
+        it["sev"] = (sev["label"], sev["class"])
+        it["sev_score"] = sev["score"]
 
     return items
 
@@ -728,10 +753,14 @@ def render_evidence_card(item):
     sev_label, sev_cls = item["sev"]
     st_label, st_cls = item["status"]
 
+    badge_cls = "badge-" + sev_cls.split("-")[1]
+    score = item.get("sev_score")
+    score_txt = f" · {score}" if score is not None else ""
+
     parts = [f'<div class="ev-card {sev_cls}">']
     parts.append('<div class="ev-head">')
     parts.append(f'<span class="status-chip {st_cls}">{esc(st_label)}</span>')
-    parts.append(f'<span class="badge {("badge-"+sev_cls.split("-")[1])}">{esc(sev_label)}</span>')
+    parts.append(f'<span class="badge {badge_cls}">{esc(sev_label)}{esc(score_txt)}</span>')
     parts.append(f'<span class="ev-title">{esc(item["title"])}</span>')
     parts.append(f'<span class="ev-module">{esc(item["module"])}</span>')
     parts.append('</div>')
@@ -967,6 +996,21 @@ with m6:
     st.metric("Chains", chains_triggered)
 with m7:
     st.metric("Risk Categories", len(risk_assessments))
+
+# AI-authored executive summary
+exec_summary = state.get("executive_summary")
+if exec_summary:
+    st.markdown(
+        '<p class="sec-title" style="margin-top:18px;">Executive Summary</p>'
+        '<p class="sec-subtitle">AI-generated narrative of the assessment</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="dash-card" style="border-left:4px solid #8B5CF6;">'
+        f'<div style="font-size:0.9rem; color:#CBD5E1; line-height:1.7;">'
+        f'{html_module.escape(str(exec_summary))}</div></div>',
+        unsafe_allow_html=True,
+    )
 
 st.divider()
 
@@ -1798,6 +1842,16 @@ with st.expander("View & Download Report", expanded=False):
         lines.append(f"Runtime:               Groq")
         lines.append(f"Assessment Start:      {state.get('assessment_start_time', 'N/A')}")
         lines.append("")
+
+        # AI-authored narrative
+        _exec = state.get("executive_summary")
+        if _exec:
+            lines.append("NARRATIVE (AI-GENERATED)")
+            lines.append("-" * 40)
+            import textwrap as _tw
+            for _ln in _tw.wrap(str(_exec), width=78):
+                lines.append(_ln)
+            lines.append("")
 
         # Metrics
         lines.append("ASSESSMENT METRICS")

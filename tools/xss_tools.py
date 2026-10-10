@@ -9,6 +9,10 @@ from playwright.sync_api import sync_playwright
 
 XSS_PAYLOAD = "<img src=x onerror=alert('XSS_MARKER')>"
 
+# Cap on live DOM-XSS confirmation attempts per assessment (each is a real
+# browser navigation; the static lead stands when the cap is reached).
+DOM_LIVE_CONFIRM_LIMIT = 5
+
 
 def is_local_target(url: str, base_url: str) -> bool:
     target = urlparse(url)
@@ -513,6 +517,70 @@ def _is_static_js_target(target):
     return False
 
 
+def _dom_xss_vectors(base_url, sources):
+    """Map detected client-side sources to candidate live injection vectors
+    (URL positions) for a DOM-XSS confirmation attempt."""
+    import uuid
+    marker = f"xss-{uuid.uuid4().hex[:12]}"
+    payload = XSS_PAYLOAD.replace("XSS_MARKER", marker)
+    base = base_url.rstrip("/")
+    joined = " ".join(sources).lower()
+
+    vectors = []
+    if any(w in joined for w in ("location", "hash", "url", "referrer", "window.name")):
+        vectors.append(("hash", f"{base}/#/{payload}"))
+        vectors.append(("hash_query", f"{base}/#/?x={payload}"))
+    if any(w in joined for w in ("search", "urlsearchparams", "url")):
+        vectors.append(("query", f"{base}/?x={payload}"))
+    if not vectors:
+        vectors.append(("hash", f"{base}/#/{payload}"))
+    return marker, vectors
+
+
+def _verify_dom_xss_live(base_url, sources):
+    """Best-effort live confirmation of a DOM-XSS lead: inject a marker payload
+    into the identified client-side source and check whether a sink executes it
+    (a matching dialog fires). Returns (confirmed: bool, vector: str|None).
+
+    Confirmation requires an actual dialog, so this never produces a false
+    positive; when nothing fires, the static lead remains "potential".
+    """
+    marker, vectors = _dom_xss_vectors(base_url, sources)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
+            fired = {"v": False}
+
+            def handle_dialog(d):
+                if d.message == marker:
+                    fired["v"] = True
+                try:
+                    d.dismiss()
+                except Exception:
+                    pass
+
+            page.on("dialog", handle_dialog)
+            try:
+                for name, vurl in vectors:
+                    try:
+                        page.goto(vurl, wait_until="domcontentloaded", timeout=12000)
+                        page.wait_for_timeout(1200)
+                    except Exception:
+                        continue
+                    if fired["v"]:
+                        return True, name
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    except Exception:
+        return False, None
+    return False, None
+
+
 def _test_dom_target(state, target):
     url = target.get("url") or target.get("endpoint")
     if not url:
@@ -599,11 +667,43 @@ def _test_dom_target(state, target):
             "validation_status": "unverified_static_lead"
         }
 
+        # Attempt bounded live confirmation: turn a static lead into a confirmed
+        # finding only when a payload injected via the identified source causes
+        # the sink to execute (a dialog fires).
+        xss_state = state.get("xss_state") if isinstance(state, dict) else None
+        attempts = 0
+        if isinstance(xss_state, dict):
+            attempts = xss_state.get("_dom_live_attempts", 0)
+
+        if attempts < DOM_LIVE_CONFIRM_LIMIT:
+            if isinstance(xss_state, dict):
+                xss_state["_dom_live_attempts"] = attempts + 1
+            base_url = f"{base_parsed.scheme}://{base_parsed.netloc}"
+            confirmed_live, vector = _verify_dom_xss_live(base_url, evidence["sources"])
+            if confirmed_live:
+                evidence["validation_status"] = "confirmed_live"
+                evidence["confirmed_vector"] = vector
+                return _xss_result(
+                    target,
+                    status="confirmed",
+                    vulnerable=True,
+                    suspected=True,
+                    confirmed=True,
+                    detail=(
+                        f"Confirmed DOM-based XSS: a payload injected via "
+                        f"{evidence['sources'][0]} ({vector}) reached sink "
+                        f"{evidence['sinks'][0]} and executed."
+                    ),
+                    evidence=evidence,
+                    sources=evidence["sources"],
+                    sinks=evidence["sinks"],
+                )
+
         return _xss_result(
             target,
             status="potential",
             suspected=True,
-            detail=f"Potential DOM-based XSS: static analysis identified source ({evidence['sources'][0]}) and sink ({evidence['sinks'][0]}); not confirmed without live browser verification.",
+            detail=f"Potential DOM-based XSS: static analysis identified source ({evidence['sources'][0]}) and sink ({evidence['sinks'][0]}); live verification did not execute it.",
             evidence=evidence,
             sources=evidence["sources"],
             sinks=evidence["sinks"]
