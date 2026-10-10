@@ -732,6 +732,19 @@ def decide_next_module(state):
             "reason": "Reconnaissance is required before any testing.",
         }
 
+    # Baseline (non-adaptive control): a traditional linear scanner. Runs the
+    # core modules in a fixed order with NO attack graph, NO LLM reasoning, and
+    # NO chaining — so it never reaches IDOR, modelling what adaptive chaining
+    # overcomes. Used by the baseline-vs-adaptive evaluation.
+    if not state.get("chaining_enabled", True):
+        for mod in CORE_MODULES:
+            if mod not in executed:
+                return {
+                    "action": mod,
+                    "reason": "Baseline linear execution (adaptive chaining disabled).",
+                }
+        return {"action": "stop", "reason": "Baseline linear assessment complete."}
+
     # 2. A verified multi-step chain is a hard follow-up and is never skipped
     #    (reliability guarantee for evidence-backed exploit chains).
     pending_chain = state.get("pending_chain")
@@ -1028,6 +1041,7 @@ def update_state_after_module(
         result.get("chain_trigger") is True
         and chain_data_obj is not None
         and (confirmed or bypass_verified)
+        and state.get("chaining_enabled", True)
     ):
         # pending_chain holds the authenticated session internally so the IDOR
         # step can use it; it is never printed/reported.
@@ -1459,12 +1473,13 @@ def generate_executive_summary(state):
 
 
 def run_agent(
-    target_url="http://localhost:3000"
+    target_url="http://localhost:3000",
+    chaining_enabled=True
 ):
 
     state = initial_state(
         target_url=target_url,
-        chaining_enabled=True
+        chaining_enabled=chaining_enabled
     )
     state["attack_graph"] = AttackGraph()
 
