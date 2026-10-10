@@ -56,6 +56,10 @@ def compute_severity(category: str, status: str = "confirmed", context: dict | N
     # Context signals that increase real-world impact.
     if context.get("authentication_bypass_verified"):
         score += 1.5
+    if context.get("stored_xss"):
+        # Stored/persistent XSS needs no victim interaction and hits every
+        # viewer, so it is materially more severe than reflected/DOM XSS.
+        score += 2.0
     if context.get("cross_user_access"):
         score += 0.8
     if context.get("multiple_records_exposed"):

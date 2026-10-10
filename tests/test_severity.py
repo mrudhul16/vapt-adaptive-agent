@@ -29,6 +29,11 @@ def test_xss_confidence_bands():
     assert lvl("xss", "potential") == "LOW"   # unconfirmed DOM lead
 
 
+def test_reflected_xss_medium_but_stored_xss_high():
+    assert lvl("xss", "confirmed") == "MEDIUM"                    # reflected/DOM
+    assert lvl("xss", "confirmed", stored_xss=True) == "HIGH"     # persistent
+
+
 def test_authorization_excessive_exposure_is_medium():
     assert lvl("authorization", "suspected", multiple_records_exposed=True) == "MEDIUM"
 

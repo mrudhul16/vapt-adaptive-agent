@@ -560,14 +560,19 @@ def build_evidence_findings(state):
         if ft != "sqli":
             continue
         data = _d(f.get("data"))
-        if not (f.get("vulnerable") or data.get("vulnerable")):
+        # Module-level findings wrap the real specialist result under a nested
+        # "data" key; read the inner dict so flags (bypass/confirmed) aren't missed.
+        inner = _d(data.get("data")) or data
+        if not (f.get("vulnerable") or data.get("vulnerable") or inner.get("vulnerable")):
             continue
-        confirmed = data.get("confirmed") is True
-        bypass = data.get("authentication_bypass_verified") is True
+        confirmed = inner.get("confirmed") is True or data.get("confirmed") is True
+        bypass = (inner.get("authentication_bypass_verified") is True
+                  or data.get("authentication_bypass_verified") is True)
         payload = None
-        for obs in data.get("observations", []) or []:
+        for obs in (inner.get("observations") or data.get("observations") or []):
             if isinstance(obs, dict) and obs.get("authentication_bypass_verified"):
                 payload = obs.get("payload")
+                bypass = True
                 break
         ev = []
         if payload:
@@ -577,10 +582,11 @@ def build_evidence_findings(state):
             "Verified — benign control failed while the injection authenticated"
             if bypass else "Not independently verified",
         ))
-        if data.get("auth_token_source"):
+        token_src = inner.get("auth_token_source") or data.get("auth_token_source")
+        if token_src:
             ev.append(("Session token obtained via",
-                       f"{data.get('auth_token_source')} (value redacted)"))
-        tgt = _d(data.get("target"))
+                       f"{token_src} (value redacted)"))
+        tgt = _d(inner.get("target")) or _d(data.get("target"))
         items.append({
             "title": "SQL Injection — Authentication Bypass",
             "module": "SQL Injection",
@@ -589,36 +595,61 @@ def build_evidence_findings(state):
             "status": ("CONFIRMED", "status-confirmed") if confirmed
             else ("SUSPECTED", "status-suspected"),
             "endpoint": tgt.get("url") or state.get("target_url", ""),
-            "summary": data.get("detail", ""),
+            "summary": inner.get("detail") or data.get("detail", ""),
             "evidence": ev,
         })
         break
 
-    # ---- IDOR (individual findings with an ownership mismatch) ----
+    # ---- IDOR (ownership mismatches) ----
+    # The per-test ownership details (authenticated_user_id, resource_owner_id,
+    # ownership_mismatch) live in idor_state["observations"]; successful_targets
+    # only stores the target dicts, so we read the observations here.
     idor_rows, auth_user = [], None
-    for f in findings:
-        ft = str(f.get("finding_type") or f.get("category") or "").lower()
-        if ft != "idor":
-            continue
-        data = _d(f.get("data"))
-        if not (data.get("ownership_mismatch") or data.get("unauthorized_access")):
-            continue
-        tgt = _d(data.get("target"))
-        auth_user = data.get("authenticated_user_id", auth_user)
+    seen_idor = set()
+
+    def _record_idor(d, tgt):
+        if not (d.get("ownership_mismatch") or d.get("unauthorized_access")):
+            return
+        tgt = _d(tgt) or _d(d.get("target"))
+        url = tgt.get("url") or d.get("url")
+        obj = d.get("object_id") or tgt.get("object_id")
+        key = (url, obj)
+        if key in seen_idor:
+            return
+        seen_idor.add(key)
+        nonlocal auth_user
+        auth_user = d.get("authenticated_user_id", auth_user)
         idor_rows.append({
-            "Resource": tgt.get("url") or data.get("url") or "—",
-            "Object ID": data.get("object_id") or tgt.get("object_id") or "—",
-            "Owner (User)": data.get("resource_owner_id", "—"),
-            "Accessed as (User)": data.get("authenticated_user_id", "—"),
-            "HTTP": data.get("status_code", "—"),
+            "Resource": url or "—",
+            "Object ID": obj if obj is not None else "—",
+            "Owner (User)": d.get("resource_owner_id", "—"),
+            "Accessed as (User)": d.get("authenticated_user_id", "—"),
+            "HTTP": d.get("status_code", "—"),
         })
+
+    for obs in idor_state.get("observations", []) or []:
+        if not isinstance(obs, dict):
+            continue
+        res = _d(obs.get("result"))
+        d = _d(res.get("data")) or res
+        _record_idor(d, obs.get("target"))
+
+    # Fallback: scan findings for any idor result shape (defensive).
+    for f in findings:
+        if str(f.get("finding_type") or f.get("category") or "").lower() != "idor":
+            continue
+        outer = _d(f.get("data"))
+        _record_idor(outer, outer.get("target"))
+        inner = _d(outer.get("data"))
+        if inner:
+            _record_idor(inner, inner.get("target"))
+
     if idor_rows:
         items.append({
             "title": "IDOR — Unauthorized Cross-User Resource Access",
             "module": "IDOR",
             "category": "idor",
-            "context": {"cross_user_access": True,
-                        "multiple_records_exposed": len(idor_rows) > 1},
+            "context": {"cross_user_access": True},
             "status": ("CONFIRMED", "status-confirmed"),
             "endpoint": "/rest/basket/{id}",
             "summary": (
@@ -638,7 +669,7 @@ def build_evidence_findings(state):
             "title": "Cross-Site Scripting — Confirmed Execution",
             "module": "XSS",
             "category": "xss",
-            "context": {},
+            "context": {"stored_xss": t.get("xss_target_type") == "stored"},
             "status": ("CONFIRMED", "status-confirmed"),
             "endpoint": t.get("url", ""),
             "summary": "Payload execution was observed (expected dialog triggered) during live testing.",
@@ -679,7 +710,7 @@ def build_evidence_findings(state):
             "title": "Cross-Site Scripting — Suspected",
             "module": "XSS",
             "category": "xss",
-            "context": {},
+            "context": {"stored_xss": t.get("xss_target_type") == "stored"},
             "status": ("SUSPECTED", "status-suspected"),
             "endpoint": t.get("url", ""),
             "summary": "Reflected/stored behavior suggests XSS, but execution was not confirmed.",
@@ -710,20 +741,25 @@ def build_evidence_findings(state):
         )
         detail = f.get("detail") or data.get("detail", "")
 
+        # Classify by the finding's actual content (authorization findings
+        # canonicalize to the "auth" category, so finding_type can't be trusted).
         if disclosed:
+            kind = "auth"
             title = "Authentication — User Enumeration"
             ev = [("Accounts enumerated", ", ".join(map(str, disclosed)))]
         elif data.get("multiple_user_records_exposed"):
+            kind = "authorization"
             title = "Authorization — Excessive Data Exposure"
             ev = [("Indicators", ", ".join(data.get("indicators", []) or []) or "—")]
         else:
-            title = "Authorization / Authentication Weakness"
+            kind = "authorization"
+            title = "Authorization / Access-Control Weakness"
             ev = [("Indicators", ", ".join(data.get("indicators", []) or []) or "—")]
 
         items.append({
             "title": title,
-            "module": "Authorization" if ft == "authorization" else "Authentication",
-            "category": "authorization" if ft == "authorization" else "auth",
+            "module": "Authorization" if kind == "authorization" else "Authentication",
+            "category": kind,
             "context": {
                 "unauthenticated": bool(disclosed),
                 "multiple_records_exposed": bool(data.get("multiple_user_records_exposed")),
@@ -746,6 +782,25 @@ def build_evidence_findings(state):
         it["sev_score"] = sev["score"]
 
     return items
+
+
+def build_category_severity(items):
+    """Max computed severity per risk category, derived from the actual
+    findings (real status + context) — so category-level cards match the
+    per-finding evidence cards instead of assuming 'confirmed' for everything.
+    Authorization findings roll up under the 'auth' risk category."""
+    out = {}
+    for it in items or []:
+        cat = it.get("category", "")
+        risk_cat = "auth" if cat in ("auth", "authorization") else cat
+        score = it.get("sev_score", 0) or 0
+        label = it.get("sev", ("", ""))[0]
+        cls = it.get("sev", ("", "sev-info"))[1]
+        badge = "badge-" + cls.split("-")[1]
+        cur = out.get(risk_cat)
+        if cur is None or score > cur["score"]:
+            out[risk_cat] = {"label": label, "badge": badge, "score": score}
+    return out
 
 
 def render_evidence_card(item):
@@ -832,7 +887,7 @@ with st.sidebar:
         </div>
         <div style="display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.04);">
             <span style="font-size:0.75rem; color:#64748B;">Orchestration</span>
-            <span style="font-size:0.75rem; color:#E2E8F0; font-weight:500;">LangGraph</span>
+            <span style="font-size:0.75rem; color:#E2E8F0; font-weight:500;">Attack Graph + LLM</span>
         </div>
         <div style="display:flex; justify-content:space-between; padding:6px 0;">
             <span style="font-size:0.75rem; color:#64748B;">Runtime</span>
@@ -942,6 +997,20 @@ vulnerabilities = count_vulnerabilities(findings)
 chains_triggered = metrics.get("chains_triggered", 0)
 chains_completed = metrics.get("chains_completed", 0)
 
+# Compute evidence findings once, and derive accurate per-category severities
+# (real status + context) that the category-level Risk cards reuse — so a
+# suspected-only AUTH finding shows LOW, not a flat 'confirmed' MEDIUM.
+evidence_items = build_evidence_findings(state)
+category_sev = build_category_severity(evidence_items)
+
+
+def risk_severity(category):
+    c = str(category or "").lower()
+    if c in category_sev:
+        e = category_sev[c]
+        return (e["label"], e["badge"])
+    return get_severity(c)
+
 
 # ============================================================
 # 1. PROFESSIONAL HEADER
@@ -965,7 +1034,7 @@ st.markdown(f"""
         </div>
         <div class="header-meta-item">
             <span class="header-meta-label">Orchestration</span>
-            <span class="header-meta-value">LangGraph</span>
+            <span class="header-meta-value">Attack Graph + LLM</span>
         </div>
         <div class="header-meta-item">
             <span class="header-meta-label">Runtime</span>
@@ -1032,7 +1101,7 @@ if risk_assessments:
     for risk in risk_assessments:
         category = str(risk.get("category", "unknown")).lower()
         category_upper = category.upper()
-        severity_label, severity_class = get_severity(category)
+        severity_label, severity_class = risk_severity(category)
         impact = html_module.escape(str(risk.get("impact", "No impact information available.")))
         remediation = html_module.escape(str(risk.get("remediation", "No remediation available.")))
 
@@ -1568,7 +1637,7 @@ if risk_assessments:
     for risk in risk_assessments:
         category = str(risk.get("category", "unknown")).lower()
         category_upper = category.upper()
-        severity_label, severity_class = get_severity(category)
+        severity_label, severity_class = risk_severity(category)
         impact = risk.get("impact", "No impact information available.")
         remediation = risk.get("remediation", "No remediation available.")
 
@@ -1838,7 +1907,7 @@ with st.expander("View & Download Report", expanded=False):
         lines.append(f"Target:                {target_display}")
         lines.append(f"Assessment Status:     COMPLETED")
         lines.append(f"AI Model:              GPT-OSS 120B")
-        lines.append(f"Orchestration:         LangGraph")
+        lines.append(f"Orchestration:         Attack Graph + LLM (custom)")
         lines.append(f"Runtime:               Groq")
         lines.append(f"Assessment Start:      {state.get('assessment_start_time', 'N/A')}")
         lines.append("")
@@ -1923,7 +1992,7 @@ with st.expander("View & Download Report", expanded=False):
         if risk_assessments:
             for risk in risk_assessments:
                 cat = risk.get("category", "unknown").upper()
-                sev, _ = get_severity(risk.get("category", ""))
+                sev, _ = risk_severity(risk.get("category", ""))
                 lines.append(f"  [{cat}] Severity: {sev}")
                 lines.append(f"    Impact: {risk.get('impact', 'N/A')}")
                 lines.append(f"    Remediation: {risk.get('remediation', 'N/A')}")
@@ -1985,7 +2054,7 @@ with st.expander("View & Download Report", expanded=False):
         if risk_assessments:
             for risk in risk_assessments:
                 cat = risk.get("category", "unknown").upper()
-                sev, sev_class = get_severity(risk.get("category", ""))
+                sev, sev_class = risk_severity(risk.get("category", ""))
                 rem = risk.get("remediation", "N/A")
                 st.markdown(f"**{cat}** <span class='badge {sev_class}'>{sev}</span><br>*{rem}*", unsafe_allow_html=True)
         else:
